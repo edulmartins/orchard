@@ -1,0 +1,2307 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Henrik Klee <henrik@goat-code.com>
+Date: Fri, 30 Oct 2026 01:18:20 +0800
+Subject: [PATCH 3/3] drm/imagination: Support the Apple A10 (T8010) GPU
+
+The A10's GPU is a Rogue core (CORE_ID 0x011b0602, legacy BVNC 13.10.6.2)
+whose firmware is Apple's GFX firmware, not Imagination's: it runs on an
+RTKit coprocessor, powers the core through Apple's "Fender" block and is
+initialized through a host-built memory layout instead of IMG's FWIF.
+
+Add an Apple firmware variant, selected by apple,t8010-gpu and
+CONFIG_DRM_POWERVR_APPLE. It keeps powervr's device, GEM, VM and MMU
+code and the UAPI, so the GPU appears as an ordinary powervr device, and
+replaces what is specific to IMG's firmware:
+
+- power: boot the coprocessor through apple-rtkit, then request Fender
+  power state 1 before any RGX register access;
+- firmware init: build the init page, memory descriptors and firmware
+  contexts (pvr_apple_layout.c) with the kernel VM context's page-table
+  root, and wait for the firmware to accept them;
+- static device information, as the firmware carries no IMG header;
+- no core clock and no RGX interrupt on the AP side.
+
+Compute jobs are queued through the firmware's command and work rings and
+complete through a stamp. A bring-up parameter, apple_selftest, runs a
+terminate-only job, a shader storing a marker, both in sequence, or the
+store in a second GPU VM.
+---
+ drivers/gpu/drm/imagination/Kconfig           |  12 +
+ drivers/gpu/drm/imagination/Makefile          |   5 +
+ drivers/gpu/drm/imagination/pvr_apple.c       | 933 ++++++++++++++++++
+ drivers/gpu/drm/imagination/pvr_apple.h       |  63 ++
+ .../gpu/drm/imagination/pvr_apple_layout.c    | 411 ++++++++
+ .../gpu/drm/imagination/pvr_apple_layout.h    |  33 +
+ drivers/gpu/drm/imagination/pvr_apple_queue.c | 135 +++
+ drivers/gpu/drm/imagination/pvr_context.c     |  52 +-
+ drivers/gpu/drm/imagination/pvr_context.h     |   9 +
+ drivers/gpu/drm/imagination/pvr_device.c      |  60 +-
+ drivers/gpu/drm/imagination/pvr_device.h      |  14 +
+ drivers/gpu/drm/imagination/pvr_drv.c         |  17 +
+ drivers/gpu/drm/imagination/pvr_job.c         |  15 +-
+ drivers/gpu/drm/imagination/pvr_mmu.c         |   8 +
+ drivers/gpu/drm/imagination/pvr_power.c       |   4 +
+ drivers/gpu/drm/imagination/pvr_queue.c       |  17 +
+ drivers/gpu/drm/imagination/pvr_vm.c          |  59 +-
+ drivers/gpu/drm/imagination/pvr_vm.h          |   2 +
+ 18 files changed, 1817 insertions(+), 32 deletions(-)
+ create mode 100644 drivers/gpu/drm/imagination/pvr_apple.c
+ create mode 100644 drivers/gpu/drm/imagination/pvr_apple.h
+ create mode 100644 drivers/gpu/drm/imagination/pvr_apple_layout.c
+ create mode 100644 drivers/gpu/drm/imagination/pvr_apple_layout.h
+ create mode 100644 drivers/gpu/drm/imagination/pvr_apple_queue.c
+
+diff --git a/drivers/gpu/drm/imagination/Kconfig b/drivers/gpu/drm/imagination/Kconfig
+index 1fd4c63..d7f65a9 100644
+--- a/drivers/gpu/drm/imagination/Kconfig
++++ b/drivers/gpu/drm/imagination/Kconfig
+@@ -19,6 +19,18 @@ config DRM_POWERVR
+ 
+ 	  If "M" is selected, the module will be called powervr.
+ 
++config DRM_POWERVR_APPLE
++	bool "Apple A10 (T8010) GPU support"
++	depends on DRM_POWERVR
++	depends on APPLE_RTKIT && (ARCH_APPLE || COMPILE_TEST)
++	depends on DRM_POWERVR=m || APPLE_RTKIT=y
++	help
++	  Support the Rogue-based GPU of the Apple A10 (T8010), which runs
++	  Apple's GFX firmware on an RTKit coprocessor instead of
++	  Imagination's firmware.
++
++	  If in doubt, say "N".
++
+ config DRM_POWERVR_KUNIT_TEST
+ 	tristate "KUnit tests for the drm powervr driver" if !KUNIT_ALL_TESTS
+ 	depends on DRM_POWERVR && KUNIT
+diff --git a/drivers/gpu/drm/imagination/Makefile b/drivers/gpu/drm/imagination/Makefile
+index a5c5e38..de8d1b1 100644
+--- a/drivers/gpu/drm/imagination/Makefile
++++ b/drivers/gpu/drm/imagination/Makefile
+@@ -29,6 +29,11 @@ powervr-y := \
+ 	pvr_vm.o \
+ 	pvr_vm_mips.o
+ 
++powervr-$(CONFIG_DRM_POWERVR_APPLE) += \
++	pvr_apple.o \
++	pvr_apple_layout.o \
++	pvr_apple_queue.o
++
+ powervr-$(CONFIG_DEBUG_FS) += \
+ 	pvr_debugfs.o
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_apple.c b/drivers/gpu/drm/imagination/pvr_apple.c
+new file mode 100644
+index 0000000..dd10f14
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_apple.c
+@@ -0,0 +1,933 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple A10 (T8010) support: Rogue fixed-function hardware driven by Apple's
++ * GFX firmware instead of Imagination's.
++ *
++ * The firmware runs on "gfx-kf", an AppleA7IOP V2 coprocessor, and speaks RTKit
++ * through the A7IOP mailbox. It powers the Rogue core through the "Fender"
++ * block; the AP may only touch RGX registers once Fender reports power state 1.
++ * The firmware maps host memory itself: a 1 MiB window at IOP address 0 holds
++ * the image and the init page, and a heap is mapped through memory descriptors
++ * (see pvr_apple_layout.c).
++ *
++ * Messages, AGX endpoints:
++ *   0x20  init: 0x81 << 48 | physical address of the init page
++ *   0x21  doorbell: 0x83 << 48 makes the firmware scan its rings
++ */
++
++#include "pvr_apple.h"
++#include "pvr_apple_layout.h"
++#include "pvr_device.h"
++#include "pvr_drv.h"
++#include "pvr_gem.h"
++#include "pvr_mmu.h"
++#include "pvr_power.h"
++#include "pvr_rogue_cr_defs.h"
++#include "pvr_rogue_heap_config.h"
++#include "pvr_vm.h"
++
++#include <drm/drm_print.h>
++#include <linux/delay.h>
++#include <linux/dma-fence.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/soc/apple/rtkit.h>
++
++#define APPLE_EP_AGX_INIT		0x20
++#define APPLE_EP_AGX_DOORBELL		0x21
++#define APPLE_MSG_INIT			(0x81ull << 48)
++#define APPLE_MSG_KICK			(0x83ull << 48)
++
++/* Fender: power-state request/acknowledge, the firmware window, the run bit */
++#define FENDER_POWER_STATE		0x1000
++#define FENDER_POWER_STATE_MASK		0x1f
++#define FENDER_POWER_REQUEST		0x10	/* | target state */
++#define FENDER_WINDOW			0x200c
++#define FENDER_RUN			0x2048
++#define FENDER_RUN_ENABLE		BIT(0)
++
++/* A7IOP: the IOP's copy of the firmware window */
++#define IOP_WINDOW			0x0008
++#define IOP_WINDOW_ENABLE		0x0038
++
++/* Heap: U+0x14 becomes 1 once the firmware accepted the init data */
++#define HEAP_U_READY			(0x5000 + 0x14)
++
++struct pvr_apple {
++	struct pvr_device *pvr_dev;
++	void __iomem *fender;
++	void __iomem *iop;
++	struct apple_rtkit *rtk;
++
++	void *win;
++	dma_addr_t win_dma;
++	size_t win_next;	/* RTKit buffers are carved after the image */
++	void *heap;
++	dma_addr_t heap_dma;
++	bool booted;
++
++	struct mutex submit_lock;	/* job slots, rings, producer index, GPU VM */
++	u32 last_seq;			/* last submitted compute job */
++	dma_addr_t vm_root;		/* page-table root GPU context 0 runs on */
++
++	/* Completion: fences of submitted jobs, signalled from the stamp */
++	u64 fence_context;
++	spinlock_t fence_lock;
++	struct list_head pending;	/* struct pvr_apple_fence, by seq */
++	struct delayed_work poll_work;
++
++	/*
++	 * GPU pages of the kernel VM context: data (stream, terminate PDS,
++	 * context state, flush scratch; also mapped into every userspace VM),
++	 * PDS and USC code at the code bases, and a self-test output page.
++	 */
++	struct pvr_apple_gpu_page {
++		struct pvr_gem_object *obj;
++		u8 *map;
++		u64 device_addr;
++	} data, pds, usc, out;
++};
++
++struct pvr_apple_fence {
++	struct dma_fence base;
++	struct list_head node;
++};
++
++/* Driver-owned GPU addresses: code at powervr's PDS and USC heap bases */
++#define APPLE_GPU_PDS		ROGUE_PDSCODEDATA_HEAP_BASE
++#define APPLE_GPU_USC		ROGUE_USCCODE_HEAP_BASE
++#define APPLE_POLL_INTERVAL	msecs_to_jiffies(1)
++#define APPLE_JOB_SLOTS		16	/* matches the layout's per-job slots */
++
++static unsigned int pvr_apple_selftest;
++module_param_named(apple_selftest, pvr_apple_selftest, uint, 0400);
++MODULE_PARM_DESC(apple_selftest,
++		 "Bring-up only (Apple A10): after firmware init, run 1 = a terminate-only compute job, 2 = a shader storing 0x1357, 3 = both in sequence, 4 = store, then store in a second GPU VM");
++
++/* The heap is coherent memory shared with the firmware, not MMIO. */
++static u32 heap_read32(struct pvr_apple *apple, u32 offset)
++{
++	return le32_to_cpu(READ_ONCE(*(__le32 *)(apple->heap + offset)));
++}
++
++static struct pvr_apple *to_apple(struct pvr_device *pvr_dev)
++{
++	return pvr_dev->apple;
++}
++
++static struct device *apple_dev(struct pvr_apple *apple)
++{
++	return from_pvr_device(apple->pvr_dev)->dev;
++}
++
++static int pvr_apple_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
++{
++	struct pvr_apple *apple = cookie;
++	size_t size = ALIGN(bfr->size, SZ_4K);
++
++	if (bfr->iova) {
++		/* Firmware-chosen address: must lie inside the window */
++		if (bfr->iova + bfr->size > PVR_APPLE_WINDOW_SIZE)
++			return -EINVAL;
++		bfr->buffer = apple->win + bfr->iova;
++		bfr->is_mapped = true;
++		return 0;
++	}
++	if (apple->win_next + size > pvr_apple_layout_init_offset())
++		return -ENOMEM;
++	bfr->iova = apple->win_next;
++	bfr->buffer = apple->win + apple->win_next;
++	apple->win_next += size;
++	return 0;
++}
++
++static void pvr_apple_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
++{
++	/* Carved from the window, which lives as long as the device */
++}
++
++static void pvr_apple_recv_message(void *cookie, u8 endpoint, u64 message)
++{
++	struct pvr_apple *apple = cookie;
++
++	dev_dbg(apple_dev(apple), "firmware ep %#x: %#016llx\n", endpoint, message);
++}
++
++static void pvr_apple_crashed(void *cookie, const void *crashlog, size_t size)
++{
++	struct pvr_apple *apple = cookie;
++
++	dev_err(apple_dev(apple), "GFX firmware crashed (%zu byte crashlog)\n", size);
++	if (crashlog)
++		print_hex_dump(KERN_ERR, "crashlog: ", DUMP_PREFIX_OFFSET, 16, 1, crashlog,
++			       min_t(size_t, size, 256), true);
++}
++
++static const struct apple_rtkit_ops pvr_apple_rtkit_ops = {
++	.crashed = pvr_apple_crashed,
++	.recv_message = pvr_apple_recv_message,
++	.shmem_setup = pvr_apple_shmem_setup,
++	.shmem_destroy = pvr_apple_shmem_destroy,
++};
++
++/* The window is programmed in two copies: Fender (4-byte stride) and IOP (8). */
++static void pvr_apple_set_window(struct pvr_apple *apple)
++{
++	const u32 fields[] = {
++		lower_32_bits(apple->win_dma), upper_32_bits(apple->win_dma),
++		0, 0, PVR_APPLE_WINDOW_SIZE, 0,
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(fields); i++) {
++		writel(fields[i], apple->fender + FENDER_WINDOW + 4 * i);
++		writel(fields[i], apple->iop + IOP_WINDOW + 8 * i);
++	}
++	writel(1, apple->iop + IOP_WINDOW_ENABLE);
++}
++
++static int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state)
++{
++	u32 val;
++	int err;
++
++	writel(FENDER_POWER_REQUEST | state, apple->fender + FENDER_POWER_STATE);
++	err = readl_poll_timeout(apple->fender + FENDER_POWER_STATE, val,
++				 (val & FENDER_POWER_STATE_MASK) == state, 100, 100000);
++	if (err)
++		dev_err(apple_dev(apple), "Fender power state %u not reached (%#x)\n", state, val);
++	return err;
++}
++
++static void pvr_apple_poll_work(struct work_struct *work);
++
++static int pvr_apple_power_init(struct pvr_device *pvr_dev)
++{
++	struct device *dev = from_pvr_device(pvr_dev)->dev;
++	struct platform_device *pdev = to_platform_device(dev);
++	const struct firmware *fw;
++	struct pvr_apple *apple;
++	const char *name = "apple/gfx-t8010.bin";
++	int err;
++
++	apple = devm_kzalloc(dev, sizeof(*apple), GFP_KERNEL);
++	if (!apple)
++		return -ENOMEM;
++	apple->pvr_dev = pvr_dev;
++	pvr_dev->apple = apple;
++	err = devm_mutex_init(dev, &apple->submit_lock);
++	if (err)
++		return err;
++	spin_lock_init(&apple->fence_lock);
++	INIT_LIST_HEAD(&apple->pending);
++	INIT_DELAYED_WORK(&apple->poll_work, pvr_apple_poll_work);
++	apple->fence_context = dma_fence_context_alloc(1);
++
++	apple->fender = devm_platform_ioremap_resource_byname(pdev, "fender");
++	if (IS_ERR(apple->fender))
++		return PTR_ERR(apple->fender);
++	apple->iop = devm_platform_ioremap_resource_byname(pdev, "iop");
++	if (IS_ERR(apple->iop))
++		return PTR_ERR(apple->iop);
++
++	/* The firmware addresses host memory physically through its own MMU. */
++	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
++	if (err)
++		return err;
++	apple->win = dmam_alloc_coherent(dev, PVR_APPLE_WINDOW_SIZE, &apple->win_dma, GFP_KERNEL);
++	apple->heap = dmam_alloc_coherent(dev, PVR_APPLE_HEAP_SIZE, &apple->heap_dma, GFP_KERNEL);
++	if (!apple->win || !apple->heap)
++		return -ENOMEM;
++	if (!IS_ALIGNED(apple->win_dma, SZ_16K))
++		return dev_err_probe(dev, -EINVAL, "firmware window %pad not 16 KiB aligned\n",
++				     &apple->win_dma);
++	apple->win_next = PVR_APPLE_FW_RUNTIME;
++
++	of_property_read_string(dev->of_node, "firmware-name", &name);
++	err = request_firmware(&fw, name, dev);
++	if (err)
++		return dev_err_probe(dev, err, "cannot load %s\n", name);
++	if (fw->size > PVR_APPLE_FW_RUNTIME) {
++		release_firmware(fw);
++		return dev_err_probe(dev, -EINVAL, "%s too large\n", name);
++	}
++	memcpy(apple->win, fw->data, fw->size);
++	release_firmware(fw);
++
++	apple->rtk = devm_apple_rtkit_init(dev, apple, NULL, 0, &pvr_apple_rtkit_ops);
++	if (IS_ERR(apple->rtk))
++		return dev_err_probe(dev, PTR_ERR(apple->rtk), "RTKit init failed\n");
++
++	/*
++	 * The firmware keeps its state only while powered, and suspending and
++	 * re-initializing it is not implemented: keep the device active.
++	 */
++	pm_runtime_forbid(dev);
++
++	return 0;
++}
++
++static int pvr_apple_power_on(struct pvr_device *pvr_dev)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++	struct device *dev = apple_dev(apple);
++	u32 state;
++	int err;
++
++	if (apple->booted)
++		return 0;
++
++	pvr_apple_set_window(apple);
++	writel(readl(apple->fender + FENDER_RUN) | FENDER_RUN_ENABLE, apple->fender + FENDER_RUN);
++
++	err = apple_rtkit_boot(apple->rtk);
++	if (err) {
++		dev_err(dev, "GFX firmware boot failed: %d\n", err);
++		goto err_stop;
++	}
++	err = apple_rtkit_start_ep(apple->rtk, APPLE_EP_AGX_INIT);
++	if (!err)
++		err = apple_rtkit_start_ep(apple->rtk, APPLE_EP_AGX_DOORBELL);
++	if (err)
++		goto err_shutdown;
++
++	/* A core left on by a previous boot is reset through state 0 first. */
++	state = readl(apple->fender + FENDER_POWER_STATE) & FENDER_POWER_STATE_MASK;
++	if (state != 0) {
++		err = pvr_apple_request_power_state(apple, 0);
++		if (err)
++			goto err_shutdown;
++	}
++	err = pvr_apple_request_power_state(apple, 1);
++	if (err)
++		goto err_shutdown;
++
++	apple->booted = true;
++	return 0;
++
++err_shutdown:
++	apple_rtkit_shutdown(apple->rtk);
++err_stop:
++	writel(readl(apple->fender + FENDER_RUN) & ~FENDER_RUN_ENABLE, apple->fender + FENDER_RUN);
++	return err;
++}
++
++static int pvr_apple_power_off(struct pvr_device *pvr_dev)
++{
++	/*
++	 * The firmware keeps its init data across idle periods; powering down and
++	 * re-initializing it is not implemented yet, so the GPU stays on.
++	 */
++	return 0;
++}
++
++const struct pvr_power_sequence_ops pvr_power_sequence_ops_apple = {
++	.init = pvr_apple_power_init,
++	.power_on = pvr_apple_power_on,
++	.power_off = pvr_apple_power_off,
++};
++
++static void wr32(u8 *base, u32 offset, u32 value)
++{
++	*(__le32 *)(base + offset) = cpu_to_le32(value);
++}
++
++static int pvr_apple_gpu_page_init_vm(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx,
++				      struct pvr_apple_gpu_page *page, u64 device_addr)
++{
++	struct pvr_device *pvr_dev = apple->pvr_dev;
++	int err;
++
++	page->obj = pvr_gem_object_create(pvr_dev, PVR_DEVICE_PAGE_SIZE,
++					  PVR_BO_FW_FLAGS_DEVICE_UNCACHED);
++	if (IS_ERR(page->obj))
++		return PTR_ERR(page->obj);
++	page->map = pvr_gem_object_vmap(page->obj);
++	if (IS_ERR(page->map)) {
++		err = PTR_ERR(page->map);
++		goto err_put;
++	}
++	memset(page->map, 0, PVR_DEVICE_PAGE_SIZE);
++	err = pvr_vm_map(vm_ctx, page->obj, 0, device_addr, PVR_DEVICE_PAGE_SIZE);
++	if (err)
++		goto err_vunmap;
++	page->device_addr = device_addr;
++	return 0;
++
++err_vunmap:
++	pvr_gem_object_vunmap(page->obj);
++err_put:
++	pvr_gem_object_put(page->obj);
++	page->obj = NULL;
++	return err;
++}
++
++static int pvr_apple_gpu_page_init(struct pvr_apple *apple, struct pvr_apple_gpu_page *page,
++				   u64 device_addr)
++{
++	return pvr_apple_gpu_page_init_vm(apple, apple->pvr_dev->kernel_vm_ctx, page, device_addr);
++}
++
++static void pvr_apple_gpu_page_fini_vm(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx,
++				       struct pvr_apple_gpu_page *page)
++{
++	if (!page->obj)
++		return;
++	pvr_vm_unmap_obj(vm_ctx, page->obj, page->device_addr, PVR_DEVICE_PAGE_SIZE);
++	pvr_gem_object_vunmap(page->obj);
++	pvr_gem_object_put(page->obj);
++	page->obj = NULL;
++}
++
++static void pvr_apple_gpu_page_fini(struct pvr_apple *apple, struct pvr_apple_gpu_page *page)
++{
++	pvr_apple_gpu_page_fini_vm(apple, apple->pvr_dev->kernel_vm_ctx, page);
++}
++
++static void pvr_apple_gpu_pages_fini(struct pvr_apple *apple)
++{
++	pvr_apple_gpu_page_fini(apple, &apple->out);
++	pvr_apple_gpu_page_fini(apple, &apple->usc);
++	pvr_apple_gpu_page_fini(apple, &apple->pds);
++	pvr_apple_gpu_page_fini(apple, &apple->data);
++}
++
++static int pvr_apple_gpu_pages_init(struct pvr_apple *apple)
++{
++	int err;
++
++	err = pvr_apple_gpu_page_init(apple, &apple->data, PVR_APPLE_GPU_DATA);
++	if (!err)
++		err = pvr_apple_gpu_page_init(apple, &apple->pds, APPLE_GPU_PDS);
++	if (!err)
++		err = pvr_apple_gpu_page_init(apple, &apple->usc, APPLE_GPU_USC);
++	if (!err)
++		err = pvr_apple_gpu_page_init(apple, &apple->out, PVR_APPLE_GPU_OUTPUT);
++	if (err) {
++		pvr_apple_gpu_pages_fini(apple);
++		return err;
++	}
++
++	/* Terminate-only stream; HALT for the terminate and context PDS programs */
++	wr32(apple->data.map, 0x0000, 0x80000000);
++	wr32(apple->data.map, 0x1000, 0xd3000000);
++	wr32(apple->pds.map, 0x0000, 0xd3000000);
++	return 0;
++}
++
++/*
++ * A one-thread compute dispatch as iPadOS submits it: CDM record 0 is a
++ * DMA-only PDS task loading the buffer binding into the USC common store,
++ * record 1 the kernel. The USC code is store_marker (out[0] = 0x1357),
++ * compiled by Apple's offline compiler for applegpu_g9p.
++ */
++static void pvr_apple_write_store_job(struct pvr_apple_gpu_page *data,
++				      struct pvr_apple_gpu_page *pds,
++				      struct pvr_apple_gpu_page *usc,
++				      struct pvr_apple_gpu_page *out)
++{
++	static const u32 usc_store_marker[] = {
++		0x81891181, 0xacb74100, 0x030201c8, 0x01200101, 0x219846d1, 0x012f0300,
++		0x0154212a, 0x09000038, 0x0000010c, 0x01802312, 0x21c88000, 0x01840302,
++		0x010046d2, 0x0000010e, 0xc000c000, 0xc000c000, 0x00008000,
++	};
++	static const u32 stream[] = {
++		0x00000004, 0x00000902, 0x00003e00, 0, 0, 0, 0x40000001, 0,	/* binding */
++		0x00002103, 0x00000800, 0x00003f00, 0, 0, 0, 0x40000000, 0,	/* kernel */
++		0x80000000,							/* terminate */
++	};
++	u64 table = pds->device_addr + 0x1000;
++	u8 *code = pds->map;
++	unsigned int i;
++
++	wr32(out->map, 0, 0xabadbeef);
++	wr32(out->map, 4, 0xabadbeef);
++
++	/* Argument table entry: {buffer address, unused, 0x10001} */
++	wr32(code, 0x1000, lower_32_bits(out->device_addr));
++	wr32(code, 0x1004, upper_32_bits(out->device_addr));
++	wr32(code, 0x1010, 0x00010001);
++	/* Binding task data and code: DOUTD x2 from the table entry */
++	wr32(code, 0x900, lower_32_bits(table));
++	wr32(code, 0x904, upper_32_bits(table));
++	wr32(code, 0x908, lower_32_bits(table + 0x10));
++	wr32(code, 0x90c, upper_32_bits(table + 0x10));
++	wr32(code, 0x910, 0x10000002);
++	wr32(code, 0x918, 0x90004001);
++	wr32(code, 0x3e00, 0xf0001000);
++	wr32(code, 0x3e04, 0xf4001808);
++	wr32(code, 0x3e08, 0xd3000000);
++	/* Kernel task data (USC offset 0x40, temps 2) and code */
++	wr32(code, 0x800, 0x40);
++	wr32(code, 0x804, 0x10);
++	wr32(code, 0x808, 0x80000000);
++	wr32(code, 0x3f00, 0xc2c00002);
++	wr32(code, 0x3f04, 0xd3000000);
++	wr32(code, 0x3f08, 0xf0000a01);
++	wr32(code, 0x3f0c, 0xfc000002);
++	wr32(code, 0x3f10, 0xd3000000);
++	for (i = 0; i < ARRAY_SIZE(usc_store_marker); i++)
++		wr32(usc->map, 0x40 + 4 * i, usc_store_marker[i]);
++	for (i = 0; i < ARRAY_SIZE(stream); i++)
++		wr32(data->map, 4 * i, stream[i]);
++}
++
++/*
++ * Run subsequent jobs on @vm_ctx. GPU context 0 is reprogrammed directly
++ * (RGX MMU context mapping); bumping its generation makes the firmware
++ * invalidate the context's TLB before the next job. One VM at a time: the
++ * caller must ensure no job of another VM is in flight.
++ */
++static void pvr_apple_switch_vm(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx)
++{
++	struct pvr_device *pvr_dev = apple->pvr_dev;
++	dma_addr_t root = pvr_vm_get_page_table_root_addr(vm_ctx);
++	__le32 *gen;
++
++	lockdep_assert_held(&apple->submit_lock);
++	if (root == apple->vm_root)
++		return;
++	*(__le64 *)(apple->heap + pvr_apple_layout_mmu_root_offset(0)) = cpu_to_le64(root);
++	pvr_cr_write32(pvr_dev, ROGUE_CR_MMU_CBASE_MAPPING_CONTEXT, 0);
++	pvr_cr_write32(pvr_dev, ROGUE_CR_MMU_CBASE_MAPPING, (u32)(root >> 12));
++	gen = (__le32 *)(apple->heap + pvr_apple_layout_mmu_gen_offset(0));
++	*gen = cpu_to_le32(le32_to_cpu(*gen) + 0x400000);	/* full invalidation */
++	wmb();
++	apple->vm_root = root;
++}
++
++static u32 pvr_apple_completed_seq(struct pvr_apple *apple)
++{
++	return heap_read32(apple, pvr_apple_layout_stamp_offset());
++}
++
++static int pvr_apple_wait(struct pvr_apple *apple, u32 seq, unsigned int timeout_us)
++{
++	u32 done;
++
++	return read_poll_timeout(pvr_apple_completed_seq, done, (s32)(done - seq) >= 0, 1000,
++				 timeout_us, false, apple);
++}
++
++/*
++ * Queue a compute job: CDM control stream at @stream, context-state buffer at
++ * @ctx_state (GPU virtual addresses in @vm_ctx). Returns its sequence number,
++ * which the firmware writes to the completion stamp when the job retires, or
++ * a negative error. May sleep: for a free job slot, and before switching GPU
++ * context 0 to another VM until that VM's jobs have retired.
++ */
++static int pvr_apple_submit_compute(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx,
++				    u64 stream, u64 ctx_state)
++{
++	u32 seq;
++	int err;
++
++	mutex_lock(&apple->submit_lock);
++	err = pvr_apple_wait(apple, apple->last_seq - (APPLE_JOB_SLOTS - 1), 5000000);
++	if (!err && pvr_vm_get_page_table_root_addr(vm_ctx) != apple->vm_root)
++		err = pvr_apple_wait(apple, apple->last_seq, 5000000);
++	if (err) {
++		dev_err(apple_dev(apple), "GPU did not retire job %u\n",
++			pvr_apple_completed_seq(apple) + 1);
++		goto out_unlock;
++	}
++	pvr_apple_switch_vm(apple, vm_ctx);
++	seq = ++apple->last_seq;
++	pvr_apple_layout_write_compute_job(apple->heap, seq, stream, ctx_state);
++	wmb();
++	WRITE_ONCE(*(__le32 *)(apple->heap + pvr_apple_layout_compute_producer()),
++		   cpu_to_le32(seq));
++	wmb();
++	err = apple_rtkit_send_message(apple->rtk, APPLE_EP_AGX_DOORBELL, APPLE_MSG_KICK, NULL,
++				       false);
++	if (err)
++		dev_err(apple_dev(apple), "doorbell for job %u failed: %d\n", seq, err);
++	else
++		err = seq;
++out_unlock:
++	mutex_unlock(&apple->submit_lock);
++	return err;
++}
++
++static const char *pvr_apple_fence_driver_name(struct dma_fence *f)
++{
++	return PVR_DRIVER_NAME;
++}
++
++static const char *pvr_apple_fence_timeline_name(struct dma_fence *f)
++{
++	return "apple-gfx";
++}
++
++static const struct dma_fence_ops pvr_apple_fence_ops = {
++	.get_driver_name = pvr_apple_fence_driver_name,
++	.get_timeline_name = pvr_apple_fence_timeline_name,
++};
++
++/* Signal the fences of retired jobs; poll again while any are pending. */
++static void pvr_apple_poll_work(struct work_struct *work)
++{
++	struct pvr_apple *apple = container_of(work, struct pvr_apple, poll_work.work);
++	struct pvr_apple_fence *fence, *tmp;
++	u32 done = pvr_apple_completed_seq(apple);
++	bool pending;
++
++	spin_lock_irq(&apple->fence_lock);
++	list_for_each_entry_safe(fence, tmp, &apple->pending, node) {
++		if ((s32)(done - (u32)fence->base.seqno) < 0)
++			break;
++		list_del_init(&fence->node);
++		dma_fence_signal_locked(&fence->base);
++		dma_fence_put(&fence->base);
++	}
++	pending = !list_empty(&apple->pending);
++	spin_unlock_irq(&apple->fence_lock);
++
++	/* The firmware sends no completion message in this setup: poll. */
++	if (pending)
++		queue_delayed_work(system_highpri_wq, &apple->poll_work, APPLE_POLL_INTERVAL);
++}
++
++static void pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
++{
++	struct pvr_apple_fence *fence, *tmp;
++
++	cancel_delayed_work_sync(&apple->poll_work);
++	spin_lock_irq(&apple->fence_lock);
++	list_for_each_entry_safe(fence, tmp, &apple->pending, node) {
++		list_del_init(&fence->node);
++		dma_fence_set_error(&fence->base, error);
++		dma_fence_signal_locked(&fence->base);
++		dma_fence_put(&fence->base);
++	}
++	spin_unlock_irq(&apple->fence_lock);
++}
++
++/**
++ * pvr_apple_submit_compute_job() - Queue a compute job on the GFX firmware
++ * @pvr_dev: Target device.
++ * @vm_ctx: GPU VM the job runs in.
++ * @stream: GPU address of the CDM control stream.
++ * @ctx_state: GPU address of the CDM context-state buffer.
++ *
++ * Return: a fence signalled when the job retires, or an ERR_PTR().
++ */
++struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
++					       struct pvr_vm_context *vm_ctx, u64 stream,
++					       u64 ctx_state)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++	struct pvr_apple_fence *fence;
++	int seq;
++
++	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
++	if (!fence)
++		return ERR_PTR(-ENOMEM);
++	seq = pvr_apple_submit_compute(apple, vm_ctx, stream, ctx_state);
++	if (seq < 0) {
++		kfree(fence);
++		return ERR_PTR(seq);
++	}
++	dma_fence_init(&fence->base, &pvr_apple_fence_ops, &apple->fence_lock,
++		       apple->fence_context, (u32)seq);
++	/* One reference for the pending list, one for the caller */
++	dma_fence_get(&fence->base);
++	spin_lock_irq(&apple->fence_lock);
++	list_add_tail(&fence->node, &apple->pending);
++	spin_unlock_irq(&apple->fence_lock);
++	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
++	return &fence->base;
++}
++
++/**
++ * pvr_apple_quiesce() - Retire every submitted job before the device goes away
++ * @pvr_dev: Target device.
++ *
++ * Userspace may exit before its last job's fence is signalled, leaving the
++ * job to be freed later from the scheduler. Wait for the GPU, signal the
++ * fences now, and run the scheduler's free_job work and the context releases
++ * it queues, so that no job outlives pvr_remove().
++ */
++void pvr_apple_quiesce(struct pvr_device *pvr_dev)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++	u32 seq;
++
++	mutex_lock(&apple->submit_lock);
++	seq = apple->last_seq;
++	mutex_unlock(&apple->submit_lock);
++
++	if (pvr_apple_wait(apple, seq, 5000000)) {
++		dev_err(apple_dev(apple), "GPU did not retire job %u before removal\n",
++			pvr_apple_completed_seq(apple) + 1);
++		pvr_apple_cancel_fences(apple, -ETIMEDOUT);
++	} else {
++		mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
++		flush_delayed_work(&apple->poll_work);
++	}
++	/* free_job first, then the context releases it queued */
++	flush_workqueue(pvr_dev->sched_wq);
++	flush_workqueue(pvr_dev->sched_wq);
++}
++
++/**
++ * pvr_apple_mmu_flush() - Invalidate GPU context 0's TLB before the next job
++ * @pvr_dev: Target device.
++ *
++ * Page-table updates of the VM GPU context 0 runs on must not be hidden by
++ * stale TLB entries. The firmware compares each context's generation with
++ * the one it acknowledged and invalidates on a change (fw 0x18530).
++ * Called from pvr_mmu_flush_exec().
++ */
++void pvr_apple_mmu_flush(struct pvr_device *pvr_dev)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++	__le32 *gen = (__le32 *)(apple->heap + pvr_apple_layout_mmu_gen_offset(0));
++
++	/*
++	 * May run in atomic context, so no lock: only the host writes the
++	 * generation, and any change makes the firmware invalidate. A bump
++	 * racing with pvr_apple_switch_vm() still changes the value.
++	 */
++	WRITE_ONCE(*gen, cpu_to_le32(le32_to_cpu(READ_ONCE(*gen)) + 0x400000));
++	wmb();
++}
++
++/*
++ * Switch GPU context 0 back to the kernel VM once its jobs have retired, so
++ * that the firmware never walks page tables that are about to be freed.
++ */
++static void pvr_apple_switch_to_kernel_vm(struct pvr_apple *apple, struct pvr_vm_context *only_if)
++{
++	struct pvr_device *pvr_dev = apple->pvr_dev;
++
++	mutex_lock(&apple->submit_lock);
++	if (!only_if || pvr_vm_get_page_table_root_addr(only_if) == apple->vm_root) {
++		if (pvr_apple_wait(apple, apple->last_seq, 5000000))
++			dev_err(apple_dev(apple), "jobs did not retire before a VM switch\n");
++		pvr_apple_switch_vm(apple, pvr_dev->kernel_vm_ctx);
++	}
++	mutex_unlock(&apple->submit_lock);
++}
++
++/**
++ * pvr_apple_vm_fini() - A VM context is about to be freed
++ * @pvr_dev: Target device.
++ * @vm_ctx: The VM context.
++ */
++void pvr_apple_vm_fini(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++
++	if (vm_ctx == pvr_dev->kernel_vm_ctx || !apple->booted)
++		return;
++	pvr_apple_switch_to_kernel_vm(apple, vm_ctx);
++}
++
++/**
++ * pvr_apple_vm_init() - Map the driver's reserved data page into a VM
++ * @pvr_dev: Target device.
++ * @vm_ctx: New userspace VM context.
++ *
++ * Every compute job names the driver's terminate and context-store PDS
++ * programs and the flush scratch address; they live in the data page at
++ * %PVR_APPLE_GPU_DATA, outside the userspace heaps.
++ */
++int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++
++	return pvr_vm_map_reserved(vm_ctx, apple->data.obj, PVR_APPLE_GPU_DATA,
++				   PVR_DEVICE_PAGE_SIZE);
++}
++
++static int pvr_apple_selftest_job(struct pvr_apple *apple, bool store)
++{
++	u32 seq, out = 0;
++	int err;
++
++	if (store)
++		pvr_apple_write_store_job(&apple->data, &apple->pds, &apple->usc, &apple->out);
++	err = pvr_apple_submit_compute(apple, apple->pvr_dev->kernel_vm_ctx, PVR_APPLE_GPU_DATA,
++				       PVR_APPLE_GPU_DATA + 0x2000);
++	if (err < 0)
++		return err;
++	seq = err;
++	err = pvr_apple_wait(apple, seq, 5000000);
++	if (store)
++		out = le32_to_cpu(READ_ONCE(*(__le32 *)apple->out.map));
++	dev_info(apple_dev(apple), "self-test: %s job %u %s (stamp %#x, out[0] %#x)\n",
++		 store ? "store" : "terminate-only", seq, err ? "did not complete" : "completed",
++		 pvr_apple_completed_seq(apple), out);
++	if (!err && store && out != 0x1357)
++		err = -EIO;
++	return err;
++}
++
++/*
++ * The store job in a second VM context with its own pages at the same GPU
++ * addresses: the marker must land in that context's output page only.
++ */
++static int pvr_apple_selftest_vm(struct pvr_apple *apple)
++{
++	struct pvr_device *pvr_dev = apple->pvr_dev;
++	struct pvr_apple_gpu_page data = {}, pds = {}, usc = {}, out = {};
++	struct pvr_vm_context *vm_ctx;
++	u32 seq, kernel_out, vm_out;
++	int err;
++
++	vm_ctx = pvr_vm_create_context(pvr_dev, false);
++	if (IS_ERR(vm_ctx)) {
++		dev_err(apple_dev(apple), "self-test: second VM: %pe\n", vm_ctx);
++		return PTR_ERR(vm_ctx);
++	}
++	err = pvr_apple_gpu_page_init_vm(apple, vm_ctx, &data, PVR_APPLE_GPU_DATA);
++	if (!err)
++		err = pvr_apple_gpu_page_init_vm(apple, vm_ctx, &pds, APPLE_GPU_PDS);
++	if (!err)
++		err = pvr_apple_gpu_page_init_vm(apple, vm_ctx, &usc, APPLE_GPU_USC);
++	if (!err)
++		err = pvr_apple_gpu_page_init_vm(apple, vm_ctx, &out, PVR_APPLE_GPU_OUTPUT);
++	if (err) {
++		dev_err(apple_dev(apple), "self-test: mapping the second VM's pages: %d\n", err);
++		goto out;
++	}
++
++	/* Context store/load and terminate programs the CDM arguments name */
++	wr32(data.map, 0x1000, 0xd3000000);
++	wr32(pds.map, 0x0000, 0xd3000000);
++	wr32(apple->out.map, 0, 0xabadbeef);
++	pvr_apple_write_store_job(&data, &pds, &usc, &out);
++
++	err = pvr_apple_submit_compute(apple, vm_ctx, PVR_APPLE_GPU_DATA,
++				       PVR_APPLE_GPU_DATA + 0x2000);
++	if (err < 0)
++		goto out_switch;
++	seq = err;
++	err = pvr_apple_wait(apple, seq, 5000000);
++	vm_out = le32_to_cpu(READ_ONCE(*(__le32 *)out.map));
++	kernel_out = le32_to_cpu(READ_ONCE(*(__le32 *)apple->out.map));
++	dev_info(apple_dev(apple),
++		 "self-test: store job %u in a second VM %s (vm out %#x, kernel out %#x)\n", seq,
++		 err ? "did not complete" : "completed", vm_out, kernel_out);
++	if (!err && (vm_out != 0x1357 || kernel_out != 0xabadbeef))
++		err = -EIO;
++
++out_switch:
++	/* Back to the kernel context */
++	mutex_lock(&apple->submit_lock);
++	pvr_apple_switch_vm(apple, pvr_dev->kernel_vm_ctx);
++	mutex_unlock(&apple->submit_lock);
++out:
++	pvr_apple_gpu_page_fini_vm(apple, vm_ctx, &out);
++	pvr_apple_gpu_page_fini_vm(apple, vm_ctx, &usc);
++	pvr_apple_gpu_page_fini_vm(apple, vm_ctx, &pds);
++	pvr_apple_gpu_page_fini_vm(apple, vm_ctx, &data);
++	pvr_vm_context_put(vm_ctx);
++	return err;
++}
++
++static void pvr_apple_selftest_compute(struct pvr_apple *apple)
++{
++	switch (pvr_apple_selftest) {
++	case 1:
++		pvr_apple_selftest_job(apple, false);
++		break;
++	case 2:
++		pvr_apple_selftest_job(apple, true);
++		break;
++	case 3:
++		if (!pvr_apple_selftest_job(apple, false))
++			pvr_apple_selftest_job(apple, true);
++		break;
++	case 4:
++		if (!pvr_apple_selftest_job(apple, true))
++			pvr_apple_selftest_vm(apple);
++		break;
++	}
++}
++
++int pvr_apple_fw_init(struct pvr_device *pvr_dev)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++	struct device *dev = apple_dev(apple);
++	u32 init = pvr_apple_layout_init_offset();
++	u32 ready;
++	int err;
++
++	err = pvr_apple_gpu_pages_init(apple);
++	if (err)
++		return err;
++
++	memset(apple->win + init, 0, PVR_APPLE_WINDOW_SIZE - init);
++	memset(apple->heap, 0, PVR_APPLE_HEAP_SIZE);
++	apple->vm_root = pvr_vm_get_page_table_root_addr(pvr_dev->kernel_vm_ctx);
++	pvr_apple_layout_build(apple->win, apple->win_dma, apple->heap, apple->heap_dma,
++			       apple->vm_root, APPLE_GPU_PDS, APPLE_GPU_USC);
++	wmb();
++
++	err = apple_rtkit_send_message(apple->rtk, APPLE_EP_AGX_INIT,
++				       APPLE_MSG_INIT | (apple->win_dma + init), NULL, false);
++	if (err)
++		goto err_pages;
++	err = read_poll_timeout(heap_read32, ready, ready == 1, 1000, 3000000, false, apple,
++				HEAP_U_READY);
++	if (err) {
++		dev_err(dev, "GFX firmware did not accept init data\n");
++		goto err_pages;
++	}
++	dev_info(dev, "GFX firmware initialized (window %pad, heap %pad)\n", &apple->win_dma,
++		 &apple->heap_dma);
++
++	if (pvr_apple_selftest)
++		pvr_apple_selftest_compute(apple);
++	return 0;
++
++err_pages:
++	pvr_apple_gpu_pages_fini(apple);
++	return err;
++}
++
++void pvr_apple_fw_fini(struct pvr_device *pvr_dev)
++{
++	struct pvr_apple *apple = to_apple(pvr_dev);
++
++	if (apple->booted)
++		pvr_apple_switch_to_kernel_vm(apple, NULL);
++	pvr_apple_cancel_fences(apple, -ENODEV);
++	pvr_apple_gpu_pages_fini(apple);
++	if (!apple->booted)
++		return;
++	pvr_apple_request_power_state(apple, 0);
++	apple_rtkit_shutdown(apple->rtk);
++	writel(readl(apple->fender + FENDER_RUN) & ~FENDER_RUN_ENABLE, apple->fender + FENDER_RUN);
++	apple->booted = false;
++}
++
++/*
++ * Static device information. Apple's firmware carries no IMG header, so the
++ * values come from the hardware (CORE_ID: 6 clusters) and the Rogue lineage.
++ */
++void pvr_apple_device_info_init(struct pvr_device *pvr_dev)
++{
++	pvr_dev->features.has_compute = true;
++	pvr_dev->features.has_cdm_control_stream_format = true;
++	pvr_dev->features.cdm_control_stream_format = 1;
++	pvr_dev->features.has_num_clusters = true;
++	pvr_dev->features.num_clusters = 6;
++	pvr_dev->features.has_phys_bus_width = true;
++	pvr_dev->features.phys_bus_width = 40;
++	pvr_dev->features.has_virtual_address_space_bits = true;
++	pvr_dev->features.virtual_address_space_bits = 40;
++	pvr_dev->features.has_tile_size_x = true;
++	pvr_dev->features.tile_size_x = 32;
++	pvr_dev->features.has_tile_size_y = true;
++	pvr_dev->features.tile_size_y = 32;
++}
+diff --git a/drivers/gpu/drm/imagination/pvr_apple.h b/drivers/gpu/drm/imagination/pvr_apple.h
+new file mode 100644
+index 0000000..8b07bc9
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_apple.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* Apple A10 (T8010): Rogue hardware behind Apple's GFX firmware. */
++
++#ifndef PVR_APPLE_H
++#define PVR_APPLE_H
++
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <uapi/drm/pvr_drm.h>
++
++struct dma_fence;
++struct pvr_context;
++struct pvr_device;
++struct pvr_job;
++struct pvr_queue;
++struct pvr_power_sequence_ops;
++struct pvr_vm_context;
++
++extern const struct pvr_power_sequence_ops pvr_power_sequence_ops_apple;
++
++#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
++int pvr_apple_fw_init(struct pvr_device *pvr_dev);
++void pvr_apple_fw_fini(struct pvr_device *pvr_dev);
++void pvr_apple_device_info_init(struct pvr_device *pvr_dev);
++struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
++					       struct pvr_vm_context *vm_ctx, u64 stream,
++					       u64 ctx_state);
++int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
++void pvr_apple_mmu_flush(struct pvr_device *pvr_dev);
++void pvr_apple_vm_fini(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
++void pvr_apple_quiesce(struct pvr_device *pvr_dev);
++
++struct pvr_queue *pvr_apple_queue_create(struct pvr_context *ctx, enum drm_pvr_job_type type);
++void pvr_apple_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity);
++int pvr_apple_queue_job_init(struct pvr_job *job, u64 drm_client_id);
++void pvr_apple_queue_job_cleanup(struct pvr_job *job);
++#else
++static inline int pvr_apple_fw_init(struct pvr_device *pvr_dev) { return -ENODEV; }
++static inline void pvr_apple_fw_fini(struct pvr_device *pvr_dev) {}
++static inline void pvr_apple_device_info_init(struct pvr_device *pvr_dev) {}
++static inline int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
++{
++	return -ENODEV;
++}
++static inline struct pvr_queue *pvr_apple_queue_create(struct pvr_context *ctx,
++							enum drm_pvr_job_type type)
++{
++	return ERR_PTR(-ENODEV);
++}
++static inline void pvr_apple_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity) {}
++static inline int pvr_apple_queue_job_init(struct pvr_job *job, u64 drm_client_id)
++{
++	return -ENODEV;
++}
++static inline void pvr_apple_queue_job_cleanup(struct pvr_job *job) {}
++static inline void pvr_apple_mmu_flush(struct pvr_device *pvr_dev) {}
++static inline void pvr_apple_quiesce(struct pvr_device *pvr_dev) {}
++static inline void pvr_apple_vm_fini(struct pvr_device *pvr_dev,
++				     struct pvr_vm_context *vm_ctx) {}
++#endif
++
++#endif /* PVR_APPLE_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_apple_layout.c b/drivers/gpu/drm/imagination/pvr_apple_layout.c
+new file mode 100644
+index 0000000..b5ea7d4
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_apple_layout.c
+@@ -0,0 +1,411 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple A10 (T8010) GPU firmware memory layout.
++ *
++ * Apple's GFX firmware runs on an A7 IOP with its own MMU. It sees two pieces of
++ * host memory:
++ *
++ *  - the window: 1 MiB at IOP address 0, holding the firmware image, the RTKit
++ *    buffers, the init page and the memory descriptors;
++ *  - the heap: host memory the firmware maps at fixed firmware virtual
++ *    addresses through those memory descriptors. It holds the firmware's
++ *    contexts, rings and queues, the GPU page tables of context 0 and the
++ *    command data.
++ *
++ * pvr_apple_layout_build() fills both from scratch. It is a pure function of
++ * the two buffers and their physical addresses, so the layout can be checked
++ * against reference images outside the kernel.
++ *
++ * Names follow the firmware's structures as far as they are understood:
++ *   X  main context (init+0x18): context pointers, ring indices, ring pointers
++ *   P  device context (X[0]): fixed GPU address windows, I/O table, unit masks
++ *   Q  flush scratch (X[1]), Z (X[2]), T MMU context table (init+0x1c)
++ *   U  debug/ready flags (init+0x98), V mapping-update ring (init+0x9c)
++ */
++
++#include "pvr_apple_layout.h"
++
++#define FW_VA_HEAP		0x00100000u	/* heap descriptor 0 */
++#define FW_VA_HEAP2		0x00140000u	/* heap descriptor 1, inner non-cacheable */
++#define HEAP2_OFFSET		0x50000u
++
++/* Window offsets (IOP address == window offset) */
++#define WIN_INIT		0x98000u
++#define WIN_DESC		0x9c000u
++
++/* Heap offsets of the firmware contexts */
++#define HEAP_X			0x00000u
++#define HEAP_P			0x02000u
++#define HEAP_T			0x04000u
++#define HEAP_U			0x05000u
++#define HEAP_Q			0x06000u
++#define HEAP_V			0x08000u
++#define HEAP_RING_INDICES	0x11000u
++#define HEAP_MMU_ROOTS		0x26000u
++#define HEAP_COMPUTE_RING	0x29000u
++#define HEAP_QUEUE		0x2b000u
++#define HEAP_QUEUE_STATE	0x2c000u
++#define HEAP_CMD_RING		0x2d000u
++#define HEAP_COMPUTE_CMD	0x2f000u
++#define HEAP_SEQ_PROGRAM	0x38000u
++#define HEAP_GPU_PC		0x40000u
++#define HEAP_GPU_PD		0x44000u
++#define HEAP_GPU_PT		0x48000u
++#define HEAP_MMU_GEN		0x52000u	/* fw VA 0x142000 */
++#define HEAP_CTX_STATE		0x53000u	/* fw VA 0x143000 */
++#define HEAP_USEQ		0x54000u	/* fw VA 0x144000: microsequence */
++#define HEAP_STAMP		0x55000u	/* fw VA 0x145000: completion stamps */
++#define HEAP_UNIT_STATE		0x56000u	/* fw VA 0x146000 */
++#define HEAP_CDM_ARGS		0x5b000u	/* fw VA 0x14b000 */
++#define HEAP_CDM_REGS		0x5c000u	/* fw VA 0x14c000 */
++#define HEAP_GPU_DATA		0x60000u	/* GPU VA 0x200000, 16 KiB */
++#define HEAP_PDS_PD		0x80000u
++#define HEAP_PDS_PT		0x7c000u
++#define HEAP_PDS_PAGE		0x84000u	/* GPU VA 0x300000000, 16 KiB */
++#define HEAP_JOBS		0x80000u	/* fw VA 0x170000: per-job slots */
++#define JOB_SLOTS		16u
++#define JOB_STRIDE		0x1000u
++#define JOB_CMD			0x000u		/* compute command, 0x2c8 bytes */
++#define JOB_USEQ		0x400u		/* microsequence, 0x80 bytes */
++#define JOB_CDM_ARGS		0x500u		/* CDM register arguments */
++#define RING_ENTRIES		256u
++#define WORK_ENTRY_SIZE		20u
++#define HEAP_IO_RAM		0x320000u	/* RAM behind unused I/O entries */
++
++/* P: I/O mapping table, 0x18-byte entries {pa lo, pa hi, fw va, size, flags, rw} */
++#define P_IO_TABLE		0x640u
++#define IO_ENTRY_SIZE		0x18u
++#define IO_FENDER		0
++#define IO_RGX			3
++#define IO_ENTRIES		7
++
++#define FENDER_PA		0x201d00000ull
++#define FENDER_SIZE		0x5000u
++#define RGX_PA			0x201000000ull
++#define RGX_SIZE		0x20000u
++
++/* GPU MMU entry flags (Rogue) */
++#define PC_VALID		0x1u
++#define PD_VALID_16K		0x3u	/* valid, 16 KiB leaf pages */
++#define PT_VALID		0x1u
++#define PT_SLC_BYPASS		0x8u
++#define PT_CC			0x4u	/* cache coherent */
++
++static inline void wr32(u8 *base, u32 offset, u32 value)
++{
++	base[offset + 0] = value;
++	base[offset + 1] = value >> 8;
++	base[offset + 2] = value >> 16;
++	base[offset + 3] = value >> 24;
++}
++
++static inline void wr16(u8 *base, u32 offset, u16 value)
++{
++	base[offset + 0] = value;
++	base[offset + 1] = value >> 8;
++}
++
++static inline void wr64(u8 *base, u32 offset, u64 value)
++{
++	wr32(base, offset, (u32)value);
++	wr32(base, offset + 4, (u32)(value >> 32));
++}
++
++/* Firmware VA of a heap offset, through descriptor 0 or 1 */
++static inline u32 fw_va(u32 offset)
++{
++	if (offset >= HEAP2_OFFSET)
++		return FW_VA_HEAP2 + (offset - HEAP2_OFFSET);
++	return FW_VA_HEAP + offset;
++}
++
++/* Memory descriptor: {fw va, pfn, 0, u16 pages, u16 flags}; flags 0 = inner non-cacheable */
++static void mem_desc(u8 *win, unsigned int index, u32 va, u64 pa, u16 pages)
++{
++	u32 entry = WIN_DESC + 16 * index;
++
++	wr32(win, entry + 0x0, va);
++	wr32(win, entry + 0x4, (u32)(pa >> 12));
++	wr32(win, entry + 0x8, 0);
++	wr16(win, entry + 0xc, pages);
++	wr16(win, entry + 0xe, 0);
++}
++
++static void io_entry(u8 *heap, unsigned int index, u64 pa, u32 size)
++{
++	u32 entry = HEAP_P + P_IO_TABLE + IO_ENTRY_SIZE * index;
++
++	wr64(heap, entry + 0x0, pa);
++	wr32(heap, entry + 0xc, size);
++	wr32(heap, entry + 0x10, 0);
++	wr32(heap, entry + 0x14, 1);	/* device, read/write */
++}
++
++static void build_main_context(u8 *heap)
++{
++	static const u32 page_pointers[] = {
++		0xe4, 0xe8, 0x134, 0x138, 0x13c, 0x140, 0x188,
++	};
++	unsigned int i;
++
++	wr32(heap, HEAP_X + 0x0, fw_va(HEAP_P));
++	wr32(heap, HEAP_X + 0x4, fw_va(HEAP_Q));
++	wr32(heap, HEAP_X + 0x8, fw_va(0x7000));	/* Z */
++
++	/* 13 rings: three index pointers each into the index page */
++	for (i = 0; i < 13; i++) {
++		wr32(heap, HEAP_X + 0xc + 0x10 * i, fw_va(HEAP_RING_INDICES + 0x10 * i));
++		wr32(heap, HEAP_X + 0x10 + 0x10 * i, fw_va(HEAP_RING_INDICES + 0x10 * i + 4));
++		wr32(heap, HEAP_X + 0x14 + 0x10 * i, fw_va(HEAP_RING_INDICES + 0x10 * i + 8));
++	}
++
++	/* Ring 2: compute work ring */
++	wr32(heap, HEAP_X + 0x38, fw_va(HEAP_COMPUTE_RING));
++
++	/* One zeroed page each, from fw VA 0x118000 on, in the order the
++	 * firmware expects them. +0xec..+0xf8 are trace rings, set below. */
++	for (i = 0; i < 2; i++)
++		wr32(heap, HEAP_X + page_pointers[i], fw_va(0x18000 + 0x1000 * i));
++	for (i = 2; i < 6; i++)
++		wr32(heap, HEAP_X + page_pointers[i], fw_va(0x1c000 + 0x1000 * (i - 2)));
++	wr32(heap, HEAP_X + 0x188, fw_va(0x20000));	/* acknowledged MMU generations */
++
++	wr32(heap, HEAP_X + 0xd8, fw_va(0x27000));	/* control ring data */
++	wr32(heap, HEAP_X + 0xdc, fw_va(0x57000));	/* event ring control */
++	wr32(heap, HEAP_X + 0xe0, fw_va(0x58000));	/* event ring entries */
++	wr32(heap, HEAP_X + 0xec, fw_va(0x75000));	/* SKU trace control */
++	wr32(heap, HEAP_X + 0xf0, fw_va(0x70000));	/* SKU trace records */
++	wr32(heap, HEAP_X + 0xf4, fw_va(0x68000));	/* firmware trace control */
++	wr32(heap, HEAP_X + 0xf8, fw_va(0x64000));	/* firmware trace records */
++
++	/* X+0x301 (unaligned): power-state struct at fw VA 0x130000 */
++	heap[HEAP_X + 0x303] = 0x13;
++}
++
++static void build_device_context(u8 *heap, u64 heap_pa, u64 pds_base, u64 usc_base)
++{
++	unsigned int k;
++
++	/* GPU address windows; the kext uses 0x300000000 for both code bases */
++	wr64(heap, HEAP_P + 0x00, 0x600000000ull);
++	wr64(heap, HEAP_P + 0x08, 0xffc00000ull);
++	wr64(heap, HEAP_P + 0x10, pds_base);		/* PDS exec base */
++	wr64(heap, HEAP_P + 0x18, usc_base);		/* USC code base */
++	wr64(heap, HEAP_P + 0x20, 0x1ffff8000ull);
++
++	io_entry(heap, IO_FENDER, FENDER_PA, FENDER_SIZE);
++	io_entry(heap, IO_RGX, RGX_PA, RGX_SIZE);
++	for (k = 1; k < IO_ENTRIES; k++) {
++		if (k == IO_RGX)
++			continue;
++		io_entry(heap, k, heap_pa + HEAP_IO_RAM + 0x20000 * k, 0x20000);
++	}
++
++	/* One scheduling unit per TA/3D/compute engine */
++	wr32(heap, HEAP_P + 0x16c0, 1);
++	wr32(heap, HEAP_P + 0x16c4, 1);
++	wr32(heap, HEAP_P + 0x16c8, 1);
++}
++
++static void build_gpu_mmu(u8 *heap, u64 gpu_root)
++{
++	/* Context-0 root array (T+0x7e0) and MMU generations (T+0x7dc) */
++	wr32(heap, HEAP_T + 0x7dc, fw_va(HEAP_MMU_GEN));
++	wr32(heap, HEAP_T + 0x7e0, fw_va(HEAP_MMU_ROOTS));
++	wr64(heap, HEAP_MMU_ROOTS, gpu_root);
++	wr32(heap, HEAP_MMU_GEN, 0x400000);	/* forces a full invalidation */
++}
++
++/*
++ * Reference layout only: hand-built context-0 page tables and pages in the
++ * heap, as the bring-up experiments used them. The driver maps GEM objects
++ * through pvr_vm instead and passes that context's root.
++ */
++static void build_reference_gpu_pages(u8 *heap, u64 heap_pa)
++{
++	/* GPU VA 0x200000 -> 16 KiB data page (stream, PDS, flush scratch) */
++	wr32(heap, HEAP_GPU_PC + 0, (u32)(((heap_pa + HEAP_GPU_PD) >> 12) << 4) | PC_VALID);
++	wr64(heap, HEAP_GPU_PD + 8, (heap_pa + HEAP_GPU_PT) | PD_VALID_16K);
++	wr64(heap, HEAP_GPU_PT, (heap_pa + HEAP_GPU_DATA) | PT_SLC_BYPASS | PT_VALID);
++
++	/* GPU VA 0x300000000 -> 16 KiB PDS/USC code page, read-only */
++	wr32(heap, HEAP_GPU_PC + 12 * 4, (u32)(((heap_pa + HEAP_PDS_PD) >> 12) << 4) | PC_VALID);
++	wr64(heap, HEAP_PDS_PD, (heap_pa + HEAP_PDS_PT) | PD_VALID_16K);
++	wr64(heap, HEAP_PDS_PT, (heap_pa + HEAP_PDS_PAGE) | PT_SLC_BYPASS | PT_CC | PT_VALID);
++
++	/* Terminate-only stream and HALT programs */
++	wr32(heap, HEAP_GPU_DATA + 0x0000, 0x80000000);
++	wr32(heap, HEAP_GPU_DATA + 0x1000, 0xd3000000);
++	wr32(heap, HEAP_PDS_PAGE, 0xd3000000);
++}
++
++static void build_compute_queue(u8 *heap)
++{
++	/* Compute work ring descriptor 0 -> queue, engine 2 (compute), head 1 */
++	wr32(heap, HEAP_COMPUTE_RING + 0x8, fw_va(HEAP_QUEUE));
++	wr32(heap, HEAP_COMPUTE_RING + 0xc, 2);
++	wr16(heap, HEAP_COMPUTE_RING + 0x10, 1);
++
++	wr32(heap, HEAP_QUEUE + 0x00, fw_va(HEAP_QUEUE_STATE));
++	wr32(heap, HEAP_QUEUE + 0x04, fw_va(HEAP_CMD_RING));
++	wr32(heap, HEAP_QUEUE + 0x0c, FW_VA_HEAP2);	/* scheduling entries */
++	wr32(heap, HEAP_QUEUE + 0x44, 1);		/* hardware unit mask */
++	wr32(heap, HEAP_QUEUE + 0x88, fw_va(0x2e000));
++	wr32(heap, HEAP_QUEUE_STATE + 0x50, 256);
++	wr32(heap, HEAP_CMD_RING, fw_va(HEAP_COMPUTE_CMD));
++}
++
++/*
++ * The compute command of the reference job: Start, WaitIRQ (compute finished),
++ * Finalize, End, with a host completion stamp at fw VA 0x145004.
++ */
++/*
++ * CDM register arguments: context/storage base (RGX+0x498), terminate PDS
++ * code/data (the driver's HALT program), control stream base (RGX+0x480).
++ */
++static void write_cdm_args(u8 *heap, u32 args, u64 stream, u64 ctx_state)
++{
++	wr64(heap, args + 0x00, ctx_state);
++	wr32(heap, args + 0x08, 0x201000);
++	wr32(heap, args + 0x0c, 0x201010);
++	wr64(heap, args + 0x10, stream);
++}
++
++/*
++ * Microsequence of a compute job: StartCompute, WaitIRQ (compute finished),
++ * FinalizeCompute, End. Finalize writes @seq to the first completion stamp.
++ */
++static void write_microsequence(u8 *heap, u32 useq, u32 cdm_args, u32 seq)
++{
++	/* StartCompute (0x48 bytes) */
++	wr32(heap, useq + 0x00, 11);
++	wr32(heap, useq + 0x04, fw_va(HEAP_CDM_REGS));
++	wr32(heap, useq + 0x08, fw_va(cdm_args));
++	wr32(heap, useq + 0x0c, fw_va(0x1e000));	/* shared unit states */
++	wr32(heap, useq + 0x2c, fw_va(HEAP_CTX_STATE));
++	wr32(heap, useq + 0x38, fw_va(HEAP_UNIT_STATE + 0x100));
++	wr32(heap, useq + 0x44, fw_va(HEAP_UNIT_STATE + 0x108));
++	/* WaitIRQ: compute finished */
++	wr32(heap, useq + 0x48, 0x100);
++	/* FinalizeCompute (0x30 bytes) */
++	wr32(heap, useq + 0x4c, 12);
++	wr32(heap, useq + 0x50, fw_va(0x1e000));
++	wr32(heap, useq + 0x68, fw_va(HEAP_STAMP));
++	wr32(heap, useq + 0x6c, seq);
++	wr32(heap, useq + 0x74, fw_va(HEAP_UNIT_STATE + 0x100));
++	/* End */
++	wr32(heap, useq + 0x7c, 2);
++}
++
++static void write_compute_command(u8 *heap, u32 cmd, u32 useq, u32 seq)
++{
++	wr32(heap, cmd + 0x000, 3);
++	wr32(heap, cmd + 0x014, fw_va(HEAP_CTX_STATE));
++	wr32(heap, cmd + 0x1e8, fw_va(useq));
++	wr32(heap, cmd + 0x1ec, 0x80);			/* microsequence size */
++	wr32(heap, cmd + 0x26c, fw_va(HEAP_STAMP + 4));	/* host stamp address */
++	wr32(heap, cmd + 0x274, seq);			/* stamp value */
++}
++
++static void build_compute_command(u8 *heap)
++{
++	/* Reference job 1 (the bring-up layout); the driver writes per-job slots */
++	write_compute_command(heap, HEAP_COMPUTE_CMD, HEAP_USEQ, 1);
++	write_microsequence(heap, HEAP_USEQ, HEAP_CDM_ARGS, 1);
++
++	wr32(heap, HEAP_UNIT_STATE + 0x108, 1);
++
++	write_cdm_args(heap, HEAP_CDM_ARGS, 0x200000, 0x202000);
++	/* Context store/load PDS program (RGX_CDM_CONTEXT_PDS0) */
++	wr32(heap, HEAP_CTX_STATE + 0x38, 0x201000);
++	wr32(heap, HEAP_CTX_STATE + 0x3c, 0x201010);
++
++	/* Q: flush scratch/fence address, programmed into RGX+0xe240 */
++	wr64(heap, HEAP_Q, 0x203000);
++}
++
++static void build_init_page(u8 *win, u64 win_pa, u64 heap_pa)
++{
++	wr64(win, WIN_INIT + 0x08, heap_pa + HEAP_SEQ_PROGRAM);	/* empty sequence */
++	wr32(win, WIN_INIT + 0x18, fw_va(HEAP_X));
++	wr32(win, WIN_INIT + 0x1c, fw_va(HEAP_T));
++	wr64(win, WIN_INIT + 0x8c, win_pa + WIN_DESC);
++	wr32(win, WIN_INIT + 0x94, 2);			/* descriptor count */
++	wr32(win, WIN_INIT + 0x98, fw_va(HEAP_U));
++	wr32(win, WIN_INIT + 0x9c, fw_va(HEAP_V));
++	wr32(win, WIN_INIT + 0xa0, fw_va(0x10000));	/* power path page */
++
++	mem_desc(win, 0, FW_VA_HEAP, heap_pa, 56);
++	mem_desc(win, 1, FW_VA_HEAP2, heap_pa + HEAP2_OFFSET, 64);
++}
++
++void pvr_apple_layout_build(u8 *win, u64 win_pa, u8 *heap, u64 heap_pa, u64 gpu_root,
++			    u64 pds_base, u64 usc_base)
++{
++	build_init_page(win, win_pa, heap_pa);
++	build_main_context(heap);
++	build_device_context(heap, heap_pa, pds_base, usc_base);
++	if (gpu_root) {
++		build_gpu_mmu(heap, gpu_root);
++	} else {
++		build_gpu_mmu(heap, heap_pa + HEAP_GPU_PC);
++		build_reference_gpu_pages(heap, heap_pa);
++	}
++	build_compute_queue(heap);
++	build_compute_command(heap);
++
++	wr32(heap, HEAP_U + 0x0, 3);			/* debug flags */
++	wr32(heap, HEAP_V + 0x455c, fw_va(0x24000));	/* mapping ring control */
++	wr32(heap, HEAP_V + 0x4560, fw_va(0x25000));	/* mapping ring entries */
++	wr32(heap, HEAP_V + 0x45b4, 1);			/* engine scheduler init */
++}
++
++/*
++ * Queue compute job @seq (1, 2, ...): its slot, command-ring entry @seq - 1 and
++ * work-ring descriptor. The caller then sets the producer index to @seq and
++ * rings the doorbell; completion shows as @seq in the stamp.
++ */
++void pvr_apple_layout_write_compute_job(u8 *heap, u32 seq, u64 stream, u64 ctx_state)
++{
++	u32 slot = HEAP_JOBS + ((seq - 1) % JOB_SLOTS) * JOB_STRIDE;
++	u32 work = HEAP_COMPUTE_RING + ((seq - 1) % RING_ENTRIES) * WORK_ENTRY_SIZE;
++	u32 i;
++
++	for (i = 0; i < JOB_STRIDE; i++)
++		heap[slot + i] = 0;
++	write_compute_command(heap, slot + JOB_CMD, slot + JOB_USEQ, seq);
++	write_microsequence(heap, slot + JOB_USEQ, slot + JOB_CDM_ARGS, seq);
++	write_cdm_args(heap, slot + JOB_CDM_ARGS, stream, ctx_state);
++
++	wr32(heap, HEAP_CMD_RING + 4 * ((seq - 1) % RING_ENTRIES), fw_va(slot + JOB_CMD));
++	for (i = 0; i < WORK_ENTRY_SIZE; i++)
++		heap[work + i] = 0;
++	wr32(heap, work + 0x8, fw_va(HEAP_QUEUE));
++	wr32(heap, work + 0xc, 2);			/* engine: compute */
++	wr16(heap, work + 0x10, seq);			/* target command-ring head */
++}
++
++u32 pvr_apple_layout_mmu_root_offset(unsigned int ctx)
++{
++	return HEAP_MMU_ROOTS + 8 * ctx;
++}
++
++u32 pvr_apple_layout_mmu_gen_offset(unsigned int ctx)
++{
++	return HEAP_MMU_GEN + 4 * ctx;
++}
++
++u32 pvr_apple_layout_init_offset(void)
++{
++	return WIN_INIT;
++}
++
++u32 pvr_apple_layout_compute_producer(void)
++{
++	return HEAP_RING_INDICES + 0x28;	/* ring 2 producer index */
++}
++
++u32 pvr_apple_layout_stamp_offset(void)
++{
++	return HEAP_STAMP + 4;
++}
+diff --git a/drivers/gpu/drm/imagination/pvr_apple_layout.h b/drivers/gpu/drm/imagination/pvr_apple_layout.h
+new file mode 100644
+index 0000000..e9121f1
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_apple_layout.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* Apple A10 (T8010) GPU firmware memory layout; see pvr_apple_layout.c. */
++
++#ifndef PVR_APPLE_LAYOUT_H
++#define PVR_APPLE_LAYOUT_H
++
++#include <linux/types.h>
++
++#define PVR_APPLE_WINDOW_SIZE	0x100000u	/* IOP window: image, RTKit, init */
++#define PVR_APPLE_FW_RUNTIME	0x8f000u	/* image + firmware runtime data */
++#define PVR_APPLE_HEAP_SIZE	0x400000u
++
++/*
++ * gpu_root: physical address of the context-0 GPU page-table root, or 0 for the
++ * reference layout with hand-built tables and pages inside the heap.
++ * pds_base, usc_base: GPU addresses PDS and USC code offsets are relative to.
++ */
++void pvr_apple_layout_build(u8 *win, u64 win_pa, u8 *heap, u64 heap_pa, u64 gpu_root,
++			    u64 pds_base, u64 usc_base);
++
++/* GPU virtual addresses the compute command and its CDM arguments use */
++#define PVR_APPLE_GPU_DATA	0x200000ull	/* stream at +0, PDS HALT at +0x1000 */
++#define PVR_APPLE_GPU_FLUSH	0x203000ull	/* flush scratch (Q) */
++#define PVR_APPLE_GPU_OUTPUT	0x204000ull
++#define PVR_APPLE_GPU_REFERENCE_CODE 0x300000000ull /* reference layout code base */
++void pvr_apple_layout_write_compute_job(u8 *heap, u32 seq, u64 stream, u64 ctx_state);
++u32 pvr_apple_layout_mmu_root_offset(unsigned int ctx);
++u32 pvr_apple_layout_mmu_gen_offset(unsigned int ctx);
++u32 pvr_apple_layout_init_offset(void);
++u32 pvr_apple_layout_compute_producer(void);
++u32 pvr_apple_layout_stamp_offset(void);
++
++#endif /* PVR_APPLE_LAYOUT_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_apple_queue.c b/drivers/gpu/drm/imagination/pvr_apple_queue.c
+new file mode 100644
+index 0000000..a6934ea
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_apple_queue.c
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple A10 (T8010) job queues.
++ *
++ * Jobs go to Apple's GFX firmware through pvr_apple_submit_compute_job() rather
++ * than IMG's CCCB and KCCB, so an Apple queue is a plain drm_sched instance:
++ * run_job translates the firmware command powervr decoded from userspace
++ * (struct rogue_fwif_cmd_compute) and returns the fence of the Apple job.
++ * Only compute jobs are supported so far.
++ */
++
++#include "pvr_apple.h"
++#include "pvr_context.h"
++#include "pvr_device.h"
++#include "pvr_job.h"
++#include "pvr_queue.h"
++#include "pvr_rogue_fwif_client.h"
++
++#include <drm/drm_print.h>
++#include <drm/gpu_scheduler.h>
++#include <linux/slab.h>
++
++#define APPLE_QUEUE_TIMEOUT_MS	5000
++
++static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
++{
++	struct pvr_job *job = container_of(sched_job, struct pvr_job, base);
++	const struct rogue_fwif_cmd_compute *cmd = job->cmd;
++
++	if (job->type != DRM_PVR_JOB_TYPE_COMPUTE)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	return pvr_apple_submit_compute_job(job->pvr_dev, job->ctx->vm_ctx,
++					    cmd->regs.cdm_ctrl_stream_base,
++					    cmd->regs.cdm_context_state_base_addr);
++}
++
++static enum drm_gpu_sched_stat pvr_apple_timedout_job(struct drm_sched_job *sched_job)
++{
++	struct pvr_job *job = container_of(sched_job, struct pvr_job, base);
++
++	/*
++	 * There is no firmware-level reset yet: report the hang and mark the
++	 * context faulty so that no further jobs are accepted on it.
++	 */
++	drm_err(from_pvr_device(job->pvr_dev), "Apple GPU job timed out\n");
++	atomic_set(&job->ctx->faulty, 1);
++	return DRM_GPU_SCHED_STAT_NO_HANG;
++}
++
++static void pvr_apple_free_job(struct drm_sched_job *sched_job)
++{
++	struct pvr_job *job = container_of(sched_job, struct pvr_job, base);
++
++	drm_sched_job_cleanup(sched_job);
++	pvr_job_put(job);
++}
++
++static const struct drm_sched_backend_ops pvr_apple_sched_ops = {
++	.run_job = pvr_apple_run_job,
++	.timedout_job = pvr_apple_timedout_job,
++	.free_job = pvr_apple_free_job,
++};
++
++struct pvr_queue *pvr_apple_queue_create(struct pvr_context *ctx, enum drm_pvr_job_type type)
++{
++	struct pvr_device *pvr_dev = ctx->pvr_dev;
++	const struct drm_sched_init_args sched_args = {
++		.ops = &pvr_apple_sched_ops,
++		.submit_wq = pvr_dev->sched_wq,
++		.num_rqs = 1,
++		.credit_limit = 64,
++		.hang_limit = 1,
++		.timeout = msecs_to_jiffies(APPLE_QUEUE_TIMEOUT_MS),
++		.timeout_wq = pvr_dev->sched_wq,
++		.name = "pvr-apple-queue",
++		.dev = pvr_dev->base.dev,
++	};
++	struct drm_gpu_scheduler *sched;
++	struct pvr_queue *queue;
++	int err;
++
++	if (type != DRM_PVR_JOB_TYPE_COMPUTE)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
++	if (!queue)
++		return ERR_PTR(-ENOMEM);
++	queue->type = type;
++	queue->ctx = ctx;
++	INIT_LIST_HEAD(&queue->node);
++	sched = &queue->scheduler;
++
++	err = drm_sched_init(sched, &sched_args);
++	if (err)
++		goto err_free;
++	err = drm_sched_entity_init(&queue->entity, DRM_SCHED_PRIORITY_KERNEL, &sched, 1,
++				    &ctx->faulty);
++	if (err)
++		goto err_sched_fini;
++	return queue;
++
++err_sched_fini:
++	drm_sched_fini(sched);
++err_free:
++	kfree(queue);
++	return ERR_PTR(err);
++}
++
++void pvr_apple_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity)
++{
++	drm_sched_fini(&queue->scheduler);
++	if (cleanup_queue_entity)
++		drm_sched_entity_fini(&queue->entity);
++	dma_fence_put(queue->last_queued_job_scheduled_fence);
++	kfree(queue);
++}
++
++int pvr_apple_queue_job_init(struct pvr_job *job, u64 drm_client_id)
++{
++	struct pvr_queue *queue;
++
++	if (atomic_read(&job->ctx->faulty))
++		return -EIO;
++	queue = pvr_context_get_queue_for_job(job->ctx, job->type);
++	if (!queue)
++		return -EINVAL;
++	return drm_sched_job_init(&job->base, &queue->entity, 1, THIS_MODULE, drm_client_id);
++}
++
++void pvr_apple_queue_job_cleanup(struct pvr_job *job)
++{
++	if (job->base.s_fence)
++		drm_sched_job_cleanup(&job->base);
++}
+diff --git a/drivers/gpu/drm/imagination/pvr_context.c b/drivers/gpu/drm/imagination/pvr_context.c
+index 406e075..1826599 100644
+--- a/drivers/gpu/drm/imagination/pvr_context.c
++++ b/drivers/gpu/drm/imagination/pvr_context.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /* Copyright (c) 2023 Imagination Technologies Ltd. */
+ 
++#include "pvr_apple.h"
+ #include "pvr_cccb.h"
+ #include "pvr_context.h"
+ #include "pvr_device.h"
+@@ -290,6 +291,10 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
+ 	if (args->flags)
+ 		return -EINVAL;
+ 
++	/* Apple's firmware runs compute jobs only, so far (see pvr_apple_queue.c). */
++	if (pvr_device_is_apple(pvr_dev) && args->type != DRM_PVR_CTX_TYPE_COMPUTE)
++		return -EOPNOTSUPP;
++
+ 	ctx_size = get_fw_obj_size(args->type);
+ 	if (ctx_size < 0)
+ 		return ctx_size;
+@@ -328,14 +333,17 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
+ 	if (err)
+ 		goto err_free_ctx_id;
+ 
+-	err = init_fw_objs(ctx, args, ctx->data);
+-	if (err)
+-		goto err_destroy_queues;
++	/* Apple's firmware has no IMG context object; its queues hold the state. */
++	if (!pvr_device_is_apple(pvr_dev)) {
++		err = init_fw_objs(ctx, args, ctx->data);
++		if (err)
++			goto err_destroy_queues;
+ 
+-	err = pvr_fw_object_create(pvr_dev, ctx_size, PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+-				   ctx_fw_data_init, ctx, &ctx->fw_obj);
+-	if (err)
+-		goto err_destroy_queues;
++		err = pvr_fw_object_create(pvr_dev, ctx_size, PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
++					   ctx_fw_data_init, ctx, &ctx->fw_obj);
++		if (err)
++			goto err_destroy_queues;
++	}
+ 
+ 	err = xa_alloc(&pvr_file->ctx_handles, &args->handle, ctx, xa_limit_32b, GFP_KERNEL);
+ 	if (err)
+@@ -348,7 +356,8 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
+ 	return 0;
+ 
+ err_destroy_fw_obj:
+-	pvr_fw_object_destroy(ctx->fw_obj);
++	if (ctx->fw_obj)
++		pvr_fw_object_destroy(ctx->fw_obj);
+ 
+ err_destroy_queues:
+ 	pvr_context_destroy_queues(ctx, true);
+@@ -373,6 +382,20 @@ err_free_ctx:
+ 	return err;
+ }
+ 
++static void
++pvr_context_release_work(struct work_struct *work)
++{
++	struct pvr_context *ctx =
++		container_of(work, struct pvr_context, release_work);
++
++	pvr_context_destroy_queues(ctx, false);
++	if (ctx->fw_obj)
++		pvr_fw_object_destroy(ctx->fw_obj);
++	kfree(ctx->data);
++	pvr_vm_context_put(ctx->vm_ctx);
++	kfree(ctx);
++}
++
+ static void
+ pvr_context_release(struct kref *ref_count)
+ {
+@@ -386,11 +409,14 @@ pvr_context_release(struct kref *ref_count)
+ 	spin_unlock(&pvr_dev->ctx_list_lock);
+ 
+ 	xa_erase(&pvr_dev->ctx_ids, ctx->ctx_id);
+-	pvr_context_destroy_queues(ctx, false);
+-	pvr_fw_object_destroy(ctx->fw_obj);
+-	kfree(ctx->data);
+-	pvr_vm_context_put(ctx->vm_ctx);
+-	kfree(ctx);
++
++	/*
++	 * Destroying the queues runs drm_sched_fini(), which must not run from
++	 * the scheduler's own free_job work. pvr_queue_device_fini() drains
++	 * sched_wq, so no release outlives the device.
++	 */
++	INIT_WORK(&ctx->release_work, pvr_context_release_work);
++	queue_work(pvr_dev->sched_wq, &ctx->release_work);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/imagination/pvr_context.h b/drivers/gpu/drm/imagination/pvr_context.h
+index 07afa17..77df094 100644
+--- a/drivers/gpu/drm/imagination/pvr_context.h
++++ b/drivers/gpu/drm/imagination/pvr_context.h
+@@ -10,6 +10,7 @@
+ #include <linux/dma-fence.h>
+ #include <linux/kref.h>
+ #include <linux/types.h>
++#include <linux/workqueue.h>
+ #include <linux/xarray.h>
+ #include <uapi/drm/pvr_drm.h>
+ 
+@@ -88,6 +89,14 @@ struct pvr_context {
+ 
+ 	/** @file_link: pvr_file PVR context list link. */
+ 	struct list_head file_link;
++
++	/**
++	 * @release_work: Destroys the queues once the last reference is gone.
++	 *
++	 * The last reference can be dropped by a job freed from a queue's own
++	 * drm_sched free_job work, which drm_sched_fini() cannot wait for.
++	 */
++	struct work_struct release_work;
+ };
+ 
+ static __always_inline struct pvr_queue *
+diff --git a/drivers/gpu/drm/imagination/pvr_device.c b/drivers/gpu/drm/imagination/pvr_device.c
+index 54fe418..af1a61b 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.c
++++ b/drivers/gpu/drm/imagination/pvr_device.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /* Copyright (c) 2023 Imagination Technologies Ltd. */
+ 
++#include "pvr_apple.h"
+ #include "pvr_device.h"
+ #include "pvr_device_info.h"
+ 
+@@ -101,7 +102,11 @@ static int pvr_device_clk_init(struct pvr_device *pvr_dev)
+ 	struct clk *sys_clk;
+ 	struct clk *mem_clk;
+ 
+-	core_clk = devm_clk_get(drm_dev->dev, "core");
++	/* Apple's GPU clocks follow its power domain; there is no core clock. */
++	if (pvr_dev->device_data->apple_fw)
++		core_clk = devm_clk_get_optional(drm_dev->dev, "core");
++	else
++		core_clk = devm_clk_get(drm_dev->dev, "core");
+ 	if (IS_ERR(core_clk))
+ 		return dev_err_probe(drm_dev->dev, PTR_ERR(core_clk),
+ 				     "failed to get core clock\n");
+@@ -535,6 +540,9 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
+ 	case PVR_PACKED_BVNC(36, 53, 104, 796):
+ 		return PVR_GPU_SUPPORTED;
+ 
++	case PVR_PACKED_BVNC(13, 10, 6, 2):	/* Apple A10 (T8010) */
++		return PVR_GPU_EXPERIMENTAL;
++
+ 	default:
+ 		return PVR_GPU_UNKNOWN;
+ 	}
+@@ -646,6 +654,34 @@ pvr_set_dma_info(struct pvr_device *pvr_dev)
+ 	return 0;
+ }
+ 
++/*
++ * Apple A10: static device information instead of an IMG firmware header,
++ * then Apple's firmware init in place of pvr_fw_init().
++ */
++static int
++pvr_device_gpu_init_apple(struct pvr_device *pvr_dev)
++{
++	int err;
++
++	pvr_apple_device_info_init(pvr_dev);
++	pvr_stream_create_musthave_masks(pvr_dev);
++
++	err = pvr_set_dma_info(pvr_dev);
++	if (err)
++		return err;
++
++	pvr_dev->kernel_vm_ctx = pvr_vm_create_context(pvr_dev, false);
++	if (IS_ERR(pvr_dev->kernel_vm_ctx))
++		return PTR_ERR(pvr_dev->kernel_vm_ctx);
++
++	err = pvr_apple_fw_init(pvr_dev);
++	if (err) {
++		pvr_vm_context_put(pvr_dev->kernel_vm_ctx);
++		pvr_dev->kernel_vm_ctx = NULL;
++	}
++	return err;
++}
++
+ /**
+  * pvr_device_gpu_init() - GPU-specific initialization for a PowerVR device
+  * @pvr_dev: Target PowerVR device.
+@@ -674,6 +710,9 @@ pvr_device_gpu_init(struct pvr_device *pvr_dev)
+ 	if (err)
+ 		return err;
+ 
++	if (pvr_device_is_apple(pvr_dev))
++		return pvr_device_gpu_init_apple(pvr_dev);
++
+ 	err = pvr_request_firmware(pvr_dev);
+ 	if (err)
+ 		return err;
+@@ -725,6 +764,13 @@ err_vm_ctx_put:
+ static void
+ pvr_device_gpu_fini(struct pvr_device *pvr_dev)
+ {
++	if (pvr_device_is_apple(pvr_dev)) {
++		pvr_apple_fw_fini(pvr_dev);
++		WARN_ON(!pvr_vm_context_put(pvr_dev->kernel_vm_ctx));
++		pvr_dev->kernel_vm_ctx = NULL;
++		return;
++	}
++
+ 	pvr_fw_fini(pvr_dev);
+ 
+ 	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
+@@ -786,9 +832,12 @@ pvr_device_init(struct pvr_device *pvr_dev)
+ 	if (err)
+ 		goto err_pm_runtime_put;
+ 
+-	err = pvr_device_irq_init(pvr_dev);
+-	if (err)
+-		goto err_device_gpu_fini;
++	/* Apple's RGX interrupt goes to the firmware coprocessor, not to us. */
++	if (!pvr_device_is_apple(pvr_dev)) {
++		err = pvr_device_irq_init(pvr_dev);
++		if (err)
++			goto err_device_gpu_fini;
++	}
+ 
+ 	pm_runtime_put(dev);
+ 
+@@ -814,7 +863,8 @@ pvr_device_fini(struct pvr_device *pvr_dev)
+ 	 * Deinitialization stages are performed in reverse order compared to
+ 	 * the initialization stages in pvr_device_init().
+ 	 */
+-	pvr_device_irq_fini(pvr_dev);
++	if (!pvr_device_is_apple(pvr_dev))
++		pvr_device_irq_fini(pvr_dev);
+ 	pvr_device_gpu_fini(pvr_dev);
+ }
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_device.h b/drivers/gpu/drm/imagination/pvr_device.h
+index d51c57c..41272c0 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -68,8 +68,13 @@ struct pvr_fw_version {
+  */
+ struct pvr_device_data {
+ 	const struct pvr_power_sequence_ops *pwr_ops;
++
++	/** @apple_fw: GPU driven by Apple's GFX firmware (see pvr_apple.c). */
++	bool apple_fw;
+ };
+ 
++struct pvr_apple;
++
+ /**
+  * struct pvr_device - powervr-specific wrapper for &struct drm_device
+  */
+@@ -114,6 +119,9 @@ struct pvr_device {
+ 	/** @device_data: Pointer to platform-specific data. */
+ 	const struct pvr_device_data *device_data;
+ 
++	/** @apple: Apple firmware state, if @device_data->apple_fw. */
++	struct pvr_apple *apple;
++
+ 	/** @regs_resource: Resource representing device control registers. */
+ 	struct resource *regs_resource;
+ 
+@@ -787,4 +795,10 @@ pvr_fw_irq_clear(struct pvr_device *pvr_dev)
+ 	pvr_dev->fw_dev.defs->irq_clear(pvr_dev);
+ }
+ 
++static inline bool
++pvr_device_is_apple(const struct pvr_device *pvr_dev)
++{
++	return IS_ENABLED(CONFIG_DRM_POWERVR_APPLE) && pvr_dev->device_data->apple_fw;
++}
++
+ #endif /* PVR_DEVICE_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_drv.c b/drivers/gpu/drm/imagination/pvr_drv.c
+index 5c965ef..5db075d 100644
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -3,6 +3,7 @@
+ 
+ #include "pvr_context.h"
+ #include "pvr_debugfs.h"
++#include "pvr_apple.h"
+ #include "pvr_device.h"
+ #include "pvr_drv.h"
+ #include "pvr_free_list.h"
+@@ -1469,6 +1470,9 @@ static void pvr_remove(struct platform_device *plat_dev)
+ 	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
+ 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+ 
++	if (pvr_device_is_apple(pvr_dev))
++		pvr_apple_quiesce(pvr_dev);
++
+ 	WARN_ON(!xa_empty(&pvr_dev->job_ids));
+ 	WARN_ON(!xa_empty(&pvr_dev->free_list_ids));
+ 
+@@ -1492,7 +1496,20 @@ static const struct pvr_device_data pvr_device_data_pwrseq = {
+ 	.pwr_ops = &pvr_power_sequence_ops_pwrseq,
+ };
+ 
++#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
++static const struct pvr_device_data pvr_device_data_apple = {
++	.pwr_ops = &pvr_power_sequence_ops_apple,
++	.apple_fw = true,
++};
++#endif
++
+ static const struct of_device_id dt_match[] = {
++#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
++	{
++		.compatible = "apple,t8010-gpu",
++		.data = &pvr_device_data_apple,
++	},
++#endif
+ 	{
+ 		.compatible = "thead,th1520-gpu",
+ 		.data = &pvr_device_data_pwrseq,
+diff --git a/drivers/gpu/drm/imagination/pvr_job.c b/drivers/gpu/drm/imagination/pvr_job.c
+index b8a58d8..7260c96 100644
+--- a/drivers/gpu/drm/imagination/pvr_job.c
++++ b/drivers/gpu/drm/imagination/pvr_job.c
+@@ -543,14 +543,17 @@ jobs_lock_all_objs(struct drm_exec *exec, struct pvr_job_data *job_data,
+ 	for (u32 i = 0; i < job_count; i++) {
+ 		struct pvr_job *job = job_data[i].job;
+ 
++		int err;
++
+ 		/* Grab a lock on a the context, to guard against
+-		 * concurrent submission to the same queue.
++		 * concurrent submission to the same queue. Apple contexts have
++		 * no firmware object; their queue's scheduler entity orders jobs.
+ 		 */
+-		int err = drm_exec_lock_obj(exec,
+-					    gem_from_pvr_gem(job->ctx->fw_obj->gem));
+-
+-		if (err)
+-			return err;
++		if (job->ctx->fw_obj) {
++			err = drm_exec_lock_obj(exec, gem_from_pvr_gem(job->ctx->fw_obj->gem));
++			if (err)
++				return err;
++		}
+ 
+ 		if (job->hwrt) {
+ 			err = prepare_fw_obj_resv(exec,
+diff --git a/drivers/gpu/drm/imagination/pvr_mmu.c b/drivers/gpu/drm/imagination/pvr_mmu.c
+index 3cac482..9d5bce3 100644
+--- a/drivers/gpu/drm/imagination/pvr_mmu.c
++++ b/drivers/gpu/drm/imagination/pvr_mmu.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /* Copyright (c) 2023 Imagination Technologies Ltd. */
+ 
++#include "pvr_apple.h"
+ #include "pvr_mmu.h"
+ 
+ #include "pvr_ccb.h"
+@@ -133,6 +134,13 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
+ 	if (!drm_dev_enter(from_pvr_device(pvr_dev), &idx))
+ 		return -EIO;
+ 
++	/* Apple's firmware invalidates on a context generation change instead. */
++	if (pvr_device_is_apple(pvr_dev)) {
++		if (atomic_xchg(&pvr_dev->mmu_flush_cache_flags, 0))
++			pvr_apple_mmu_flush(pvr_dev);
++		goto err_drm_dev_exit;
++	}
++
+ 	/* Can't flush MMU if the firmware hasn't been initialised yet. */
+ 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
+ 		goto err_drm_dev_exit;
+diff --git a/drivers/gpu/drm/imagination/pvr_power.c b/drivers/gpu/drm/imagination/pvr_power.c
+index eb4b6ec..0793bbd 100644
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -434,6 +434,10 @@ pvr_power_device_idle(struct device *dev)
+ 	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
+ 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+ 
++	/* Apple firmware power management is not implemented: stay active. */
++	if (pvr_device_is_apple(pvr_dev))
++		return -EBUSY;
++
+ 	return pvr_power_is_idle(pvr_dev) ? 0 : -EBUSY;
+ }
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_queue.c b/drivers/gpu/drm/imagination/pvr_queue.c
+index 24a8645..58be790 100644
+--- a/drivers/gpu/drm/imagination/pvr_queue.c
++++ b/drivers/gpu/drm/imagination/pvr_queue.c
+@@ -5,6 +5,7 @@
+ #include <drm/gpu_scheduler.h>
+ #include <linux/overflow.h>
+ 
++#include "pvr_apple.h"
+ #include "pvr_cccb.h"
+ #include "pvr_context.h"
+ #include "pvr_device.h"
+@@ -1145,6 +1146,9 @@ int pvr_queue_job_init(struct pvr_job *job, u64 drm_client_id)
+ 	struct pvr_queue *queue;
+ 	int err;
+ 
++	if (pvr_device_is_apple(job->pvr_dev))
++		return pvr_apple_queue_job_init(job, drm_client_id);
++
+ 	if (atomic_read(&job->ctx->faulty))
+ 		return -EIO;
+ 
+@@ -1198,6 +1202,11 @@ struct dma_fence *pvr_queue_job_arm(struct pvr_job *job)
+  */
+ void pvr_queue_job_cleanup(struct pvr_job *job)
+ {
++	if (pvr_device_is_apple(job->pvr_dev)) {
++		pvr_apple_queue_job_cleanup(job);
++		return;
++	}
++
+ 	pvr_queue_fence_put(job->done_fence);
+ 	pvr_queue_fence_put(job->cccb_fence);
+ 	pvr_kccb_fence_put(job->kccb_fence);
+@@ -1301,6 +1310,9 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
+ 	if (WARN_ON(type >= sizeof(props)))
+ 		return ERR_PTR(-EINVAL);
+ 
++	if (pvr_device_is_apple(pvr_dev))
++		return pvr_apple_queue_create(ctx, type);
++
+ 	switch (ctx->type) {
+ 	case DRM_PVR_CTX_TYPE_RENDER:
+ 		if (type != DRM_PVR_JOB_TYPE_GEOMETRY &&
+@@ -1453,6 +1465,11 @@ void pvr_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity)
+ 	if (!queue)
+ 		return;
+ 
++	if (pvr_device_is_apple(queue->ctx->pvr_dev)) {
++		pvr_apple_queue_destroy(queue, cleanup_queue_entity);
++		return;
++	}
++
+ 	mutex_lock(&queue->ctx->pvr_dev->queues.lock);
+ 	list_del_init(&queue->node);
+ 	mutex_unlock(&queue->ctx->pvr_dev->queues.lock);
+diff --git a/drivers/gpu/drm/imagination/pvr_vm.c b/drivers/gpu/drm/imagination/pvr_vm.c
+index ceb7869..96bc1d1 100644
+--- a/drivers/gpu/drm/imagination/pvr_vm.c
++++ b/drivers/gpu/drm/imagination/pvr_vm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /* Copyright (c) 2023 Imagination Technologies Ltd. */
+ 
++#include "pvr_apple.h"
+ #include "pvr_vm.h"
+ 
+ #include "pvr_device.h"
+@@ -50,6 +51,9 @@ struct pvr_vm_context {
+ 	/** @lock: Global lock on this VM. */
+ 	struct mutex lock;
+ 
++	/** @is_userspace_context: Mappings must lie within the userspace heaps. */
++	bool is_userspace_context;
++
+ 	/**
+ 	 * @fw_mem_ctx_obj: Firmware object representing firmware memory
+ 	 * context.
+@@ -231,10 +235,10 @@ static int
+ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
+ 			struct pvr_vm_context *vm_ctx,
+ 			struct pvr_gem_object *pvr_obj, u64 offset,
+-			u64 device_addr, u64 size)
++			u64 device_addr, u64 size, bool reserved)
+ {
+ 	struct drm_gem_object *obj = gem_from_pvr_gem(pvr_obj);
+-	const bool is_user = vm_ctx != vm_ctx->pvr_dev->kernel_vm_ctx;
++	const bool is_user = vm_ctx->is_userspace_context;
+ 	const u64 pvr_obj_size = pvr_gem_object_size(pvr_obj);
+ 	struct sg_table *sgt;
+ 	u64 offset_plus_size;
+@@ -243,7 +247,7 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
+ 	if (check_add_overflow(offset, size, &offset_plus_size))
+ 		return -EINVAL;
+ 
+-	if (is_user &&
++	if (is_user && !reserved &&
+ 	    !pvr_find_heap_containing(vm_ctx->pvr_dev, device_addr, size)) {
+ 		return -EINVAL;
+ 	}
+@@ -570,13 +574,15 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	vm_ctx->pvr_dev = pvr_dev;
++	vm_ctx->is_userspace_context = is_userspace_context;
+ 
+ 	vm_ctx->mmu_ctx = pvr_mmu_context_create(pvr_dev);
+ 	err = PTR_ERR_OR_ZERO(vm_ctx->mmu_ctx);
+ 	if (err)
+ 		goto err_free;
+ 
+-	if (is_userspace_context) {
++	/* Apple's firmware has no IMG memory-context object (see pvr_apple.c). */
++	if (is_userspace_context && !pvr_device_is_apple(pvr_dev)) {
+ 		err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_fwmemcontext),
+ 					   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
+ 					   fw_mem_context_init, vm_ctx, &vm_ctx->fw_mem_ctx_obj);
+@@ -594,6 +600,14 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
+ 	mutex_init(&vm_ctx->lock);
+ 	kref_init(&vm_ctx->ref_count);
+ 
++	if (is_userspace_context && pvr_device_is_apple(pvr_dev)) {
++		err = pvr_apple_vm_init(pvr_dev, vm_ctx);
++		if (err) {
++			pvr_vm_context_put(vm_ctx);
++			return ERR_PTR(err);
++		}
++	}
++
+ 	return vm_ctx;
+ 
+ err_page_table_destroy:
+@@ -618,6 +632,10 @@ pvr_vm_context_release(struct kref *ref_count)
+ 	struct pvr_vm_context *vm_ctx =
+ 		container_of(ref_count, struct pvr_vm_context, ref_count);
+ 
++	/* Apple: GPU context 0 must not keep running on these page tables. */
++	if (pvr_device_is_apple(vm_ctx->pvr_dev))
++		pvr_apple_vm_fini(vm_ctx->pvr_dev, vm_ctx);
++
+ 	if (vm_ctx->fw_mem_ctx_obj)
+ 		pvr_fw_object_destroy(vm_ctx->fw_mem_ctx_obj);
+ 
+@@ -723,9 +741,9 @@ pvr_vm_lock_extra(struct drm_gpuvm_exec *vm_exec)
+  *    destroy the mapping (returned from pvr_vm_gpuva_map or
+  *    pvr_vm_gpuva_remap).
+  */
+-int
+-pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+-	   u64 pvr_obj_offset, u64 device_addr, u64 size)
++static int
++__pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
++	     u64 pvr_obj_offset, u64 device_addr, u64 size, bool reserved)
+ {
+ 	struct pvr_vm_bind_op bind_op = {0};
+ 	struct drm_gpuvm_exec vm_exec = {
+@@ -740,7 +758,7 @@ pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+ 
+ 	int err = pvr_vm_bind_op_map_init(&bind_op, vm_ctx, pvr_obj,
+ 					  pvr_obj_offset, device_addr,
+-					  size);
++					  size, reserved);
+ 
+ 	if (err)
+ 		return err;
+@@ -763,6 +781,31 @@ err_cleanup:
+ 	return err;
+ }
+ 
++int
++pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
++	   u64 pvr_obj_offset, u64 device_addr, u64 size)
++{
++	return __pvr_vm_map(vm_ctx, pvr_obj, pvr_obj_offset, device_addr, size, false);
++}
++
++/**
++ * pvr_vm_map_reserved() - Map a driver-owned object outside the userspace heaps
++ * @vm_ctx: Target VM context.
++ * @pvr_obj: Target PowerVR memory object.
++ * @device_addr: Virtual device address at the start of the mapping.
++ * @size: Size of the mapping.
++ *
++ * Like pvr_vm_map() at object offset 0, without requiring a userspace
++ * context's mapping to lie within a heap. For addresses the firmware or the
++ * driver's own GPU programs use in every VM.
++ */
++int
++pvr_vm_map_reserved(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
++		    u64 device_addr, u64 size)
++{
++	return __pvr_vm_map(vm_ctx, pvr_obj, 0, device_addr, size, true);
++}
++
+ /**
+  * pvr_vm_unmap_obj_locked() - Unmap an already mapped section of device-virtual
+  * memory.
+diff --git a/drivers/gpu/drm/imagination/pvr_vm.h b/drivers/gpu/drm/imagination/pvr_vm.h
+index b0528df..9555094 100644
+--- a/drivers/gpu/drm/imagination/pvr_vm.h
++++ b/drivers/gpu/drm/imagination/pvr_vm.h
+@@ -38,6 +38,8 @@ struct pvr_vm_context *pvr_vm_create_context(struct pvr_device *pvr_dev,
+ int pvr_vm_map(struct pvr_vm_context *vm_ctx,
+ 	       struct pvr_gem_object *pvr_obj, u64 pvr_obj_offset,
+ 	       u64 device_addr, u64 size);
++int pvr_vm_map_reserved(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
++			u64 device_addr, u64 size);
+ int pvr_vm_unmap_obj(struct pvr_vm_context *vm_ctx,
+ 		     struct pvr_gem_object *pvr_obj,
+ 		     u64 device_addr, u64 size);
+-- 
+2.54.0 (Apple Git-157)
+

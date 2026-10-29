@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Henrik Klee <henrik@goat-code.com>
+Date: Fri, 30 Oct 2026 01:18:20 +0800
+Subject: [PATCH 2/3] arm64: dts: apple: t8010: Describe the GPU
+
+The A10's GPU is a PowerVR Rogue core behind Apple's "Fender" power and
+control block, driven by Apple's GFX firmware on the gfx-kf coprocessor
+(an AppleA7IOP V2). Describe the core, Fender and the coprocessor as one
+node with three register ranges, its power domain and the firmware name,
+plus the coprocessor's mailbox. Enable both on the iPad 6.
+---
+ arch/arm64/boot/dts/apple/t8010-j71b.dts |  4 ++++
+ arch/arm64/boot/dts/apple/t8010.dtsi     | 26 ++++++++++++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8010-j71b.dts b/arch/arm64/boot/dts/apple/t8010-j71b.dts
+index 2aada48..1b04feb 100644
+--- a/arch/arm64/boot/dts/apple/t8010-j71b.dts
++++ b/arch/arm64/boot/dts/apple/t8010-j71b.dts
+@@ -20,3 +20,7 @@
+ &touchscreen {
+ 	firmware-name = "apple/j71b-fwstart.z2fw";
+ };
++
++&gpu {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/apple/t8010.dtsi b/arch/arm64/boot/dts/apple/t8010.dtsi
+index 5ff9aa1..d8da2a4 100644
+--- a/arch/arm64/boot/dts/apple/t8010.dtsi
++++ b/arch/arm64/boot/dts/apple/t8010.dtsi
+@@ -267,6 +267,32 @@
+ 			status = "disabled";
+ 		};
+ 
++		gpu: gpu@201000000 {
++			compatible = "apple,t8010-gpu";
++			reg = <0x2 0x01000000 0x0 0x100000>,
++			      <0x2 0x01d00000 0x0 0x5000>,
++			      <0x2 0x01d20000 0x0 0x4000>;
++			reg-names = "rgx", "fender", "iop";
++			mboxes = <&gpu_mbox>;
++			power-domains = <&ps_gfx>;
++			firmware-name = "apple/gfx-t8010.bin";
++			status = "disabled";
++		};
++
++		gpu_mbox: mbox@201d24000 {
++			compatible = "apple,t8010-a7iop-mailbox";
++			reg = <0x2 0x01d24000 0x0 0x1000>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 189 IRQ_TYPE_LEVEL_HIGH>,
++				     <AIC_IRQ 190 IRQ_TYPE_LEVEL_HIGH>,
++				     <AIC_IRQ 191 IRQ_TYPE_LEVEL_HIGH>,
++				     <AIC_IRQ 192 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "send-empty", "send-not-empty",
++					  "recv-empty", "recv-not-empty";
++			#mbox-cells = <0>;
++			power-domains = <&ps_gfx>;
++		};
++
+ 		sio: dma-controller@20ae00000 {
+ 			compatible = "apple,t8010-sio";
+ 			reg = <0x2 0x0ae00000 0x0 0x10000>,
+-- 
+2.54.0 (Apple Git-157)
+
