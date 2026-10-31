@@ -1,0 +1,58 @@
+From 00f3c459cce0a2a5f527ee8ead92164edaef897d Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:37:48 -0500
+Subject: [PATCH] arm64: dts: apple: t8015: Add the PCIe DARTs
+
+The APCIE root complex has one DART per port. The runtime ADT describes
+dart-apcie2 and dart-apcie3 at 0x603008000 and 0x604008000, with one
+interrupt each (347 and 350) and a 0x3ffff000 vm-size.
+
+Their dart-options, fetch-config and diag-config values match the
+s5l8960x generation, so describe them with the s5l8960x fallback and
+carry the ADT error-reflector, fetch-config and diag-config, as iOS
+programs them at every DART init.
+
+They stay disabled until the h9p PCIe driver knows the T8015.
+---
+ arch/arm64/boot/dts/apple/t8015.dtsi | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015.dtsi b/arch/arm64/boot/dts/apple/t8015.dtsi
+index 85ab9bf..3ddce22 100644
+--- a/arch/arm64/boot/dts/apple/t8015.dtsi
++++ b/arch/arm64/boot/dts/apple/t8015.dtsi
+@@ -684,6 +684,34 @@
+ 			power-domains = <&ps_ans2>;
+ 		};
+ 
++		dart_apcie2: iommu@603008000 {
++			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
++			reg = <0x6 0x03008000 0x0 0x4000>;
++			#iommu-cells = <5>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&ps_pcie>;
++			/* ADT dart-apcie2: error-reflector, fetch-config, diag-config */
++			apple,error-reflector = /bits/ 64 <0x233ffc000>;
++			apple,fetch-config = <0x000e0303>;
++			apple,diag-config = <0x80000100>;
++			status = "disabled";
++		};
++
++		dart_apcie3: iommu@604008000 {
++			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
++			reg = <0x6 0x04008000 0x0 0x4000>;
++			#iommu-cells = <5>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&ps_pcie>;
++			/* ADT dart-apcie3: error-reflector, fetch-config, diag-config */
++			apple,error-reflector = /bits/ 64 <0x233ffc000>;
++			apple,fetch-config = <0x000e0303>;
++			apple,diag-config = <0x80000100>;
++			status = "disabled";
++		};
++
+ 		nvme@259cc0000 {
+ 			compatible = "apple,t8015-nvme-ans2";
+ 			reg = <0x2 0x59cc0000 0x0 0x40000>,

@@ -1,0 +1,177 @@
+From d8b62c2a2c8a60257a292cff6a90009aab8e130a Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:12 -0500
+Subject: [PATCH] dt-bindings: PCI: apple-t8010-pcie: Add the T8015 variant
+
+The T8015 keeps the four-port H8P/H9P register map but gives each port
+its own NVMMU window (portN and portN-nvmmu) and has no storage port,
+so its NVMe controller is the separate ANS2 block. It therefore has
+twelve reg entries, four port interrupts and no storage-port NVMMU
+properties.
+
+Describe that layout in the Apple PCIe binding so the T8015 node can be
+validated. The T8010 layout stays the default.
+---
+ .../bindings/pci/apple,t8010-pcie.yaml        | 111 ++++++++++++------
+ 1 file changed, 76 insertions(+), 35 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+index 83db67f..6fa82fd 100644
+--- a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+@@ -4,17 +4,17 @@
+ $id: http://devicetree.org/schemas/pci/apple,t8010-pcie.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Apple S8003, T7000 and T8010 PCIe host controller
++title: Apple S8003, T7000, T8010 and T8015 PCIe host controller
+ 
+ maintainers:
+   - Paul Praschl <praschlpaul@g-p.at>
+ 
+ description: |
+-  Apple A9/S8003 (TSMC) and A10/T8010 devices use the H8P/H9P PCIe root
+-  complex for internal storage and Wi-Fi. It exposes one ECAM window shared
+-  by up to four root ports, controller-specific PHY and port register
+-  windows, and a local MSI block. Both SoCs share this register map but
+-  need different power-up and link training sequences.
++  Apple A9/S8003 (TSMC), A10/T8010 and A11/T8015 devices use the H8P/H9P
++  PCIe root complex for internal storage and Wi-Fi. It exposes one ECAM
++  window shared by up to four root ports, controller-specific PHY and port
++  register windows, and a local MSI block. The SoCs share this register map
++  but need different power-up and link training sequences.
+ 
+   The storage port also contains an NVMMU which translates the proprietary
+   Apple ANS FlatDMA format. Unlike a general-purpose IOMMU, this block uses a
+@@ -22,6 +22,10 @@ description: |
+   window. The PCIe driver owns that NVMMU state and exposes it only to the ANS
+   NVMe glue.
+ 
++  The T8015 has no PCIe storage port: its NVMe controller is the separate
++  ANS2 block. Each T8015 root port instead has its own NVMMU window, so the
++  T8015 does not use the storage-port NVMMU properties.
++
+   Apple A8/A8X (T7000/T7001) devices use an earlier version of the same root
+   complex, with the same ECAM layout, port register block and MSI block. It
+   has no separate PHY register windows and no NVMMU, and its reference and
+@@ -66,31 +70,67 @@ allOf:
+         apple,nvme-hmb: false
+         apple,preinit-phy-port-mask: false
+     else:
+-      properties:
+-        reg:
+-          minItems: 9
+-        reg-names:
+-          items:
+-            - const: config
+-            - const: rc
+-            - const: phy
+-            - const: phy-ip
+-            - const: port0
+-            - const: port1
+-            - const: port2
+-            - const: port3
+-            - const: nvmmu
+-        interrupts:
+-          minItems: 5
+-        interrupt-names:
+-          minItems: 5
+-        power-domains:
+-          maxItems: 1
+-      required:
+-        - clocks
+-        - clock-names
+-        - apple,nvmmu-iova
+-        - apple,nvme-hmb
++      if:
++        properties:
++          compatible:
++            contains:
++              const: apple,t8015-pcie
++      then:
++        properties:
++          reg:
++            minItems: 12
++            maxItems: 12
++          reg-names:
++            items:
++              - const: config
++              - const: port0
++              - const: port0-nvmmu
++              - const: port1
++              - const: port1-nvmmu
++              - const: port2
++              - const: port2-nvmmu
++              - const: port3
++              - const: port3-nvmmu
++              - const: rc
++              - const: phy
++              - const: phy-ip
++          interrupts:
++            minItems: 4
++            maxItems: 4
++          interrupt-names:
++            minItems: 4
++            maxItems: 4
++          power-domains:
++            maxItems: 1
++        required:
++          - clocks
++          - clock-names
++      else:
++        properties:
++          reg:
++            minItems: 9
++          reg-names:
++            items:
++              - const: config
++              - const: rc
++              - const: phy
++              - const: phy-ip
++              - const: port0
++              - const: port1
++              - const: port2
++              - const: port3
++              - const: nvmmu
++          interrupts:
++            minItems: 5
++          interrupt-names:
++            minItems: 5
++          power-domains:
++            maxItems: 1
++        required:
++          - clocks
++          - clock-names
++          - apple,nvmmu-iova
++          - apple,nvme-hmb
+ 
+ properties:
+   compatible:
+@@ -99,22 +139,23 @@ properties:
+           - apple,s8003-pcie
+           - apple,t7000-pcie
+           - apple,t8010-pcie
++          - apple,t8015-pcie
+       - items:
+           - const: apple,j172-pcie
+           - const: apple,t8010-pcie
+ 
+   reg:
+     minItems: 6
+-    maxItems: 9
++    maxItems: 12
+ 
+   reg-names:
+     minItems: 6
+-    maxItems: 9
++    maxItems: 12
+ 
+   interrupts:
+     description:
+-      One state interrupt for each root port followed, on T8010, by the
+-      storage-port NVMMU fault interrupt.
++      One state interrupt for each root port followed, on the SoCs with a
++      storage-port NVMMU, by its fault interrupt.
+     minItems: 4
+     maxItems: 5
+ 

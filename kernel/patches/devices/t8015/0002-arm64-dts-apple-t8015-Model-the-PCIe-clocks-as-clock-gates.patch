@@ -1,0 +1,64 @@
+From c30f4632e9ee5515eded4c747963d06f69c59197 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:28:12 -0500
+Subject: [PATCH] arm64: dts: apple: t8015: Model the PCIe clocks as clock
+ gates
+
+The T8015 PMGR exposes pcie_ref and pcie_aux as clock gates that the
+PCIe controller drives itself, but t8015-pmgr.dtsi describes them as
+power domains. t8010-pmgr.dtsi already uses the clock-gate model for
+the same two gates.
+
+Drop the power-domain and reset cells from ps_pcie_ref and ps_pcie_aux,
+make them clock controllers with apple,clock-gate-only, and let ps_pcie
+consume the always-on pcie_direct gate. Mark ps_pcie with apple,manual-pm
+so the PCIe driver owns the power-up sequence, matching the A10.
+
+No consumer references the two gates as power domains today.
+---
+ arch/arm64/boot/dts/apple/t8015-pmgr.dtsi | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015-pmgr.dtsi b/arch/arm64/boot/dts/apple/t8015-pmgr.dtsi
+index 1d8da9c..480e54c 100644
+--- a/arch/arm64/boot/dts/apple/t8015-pmgr.dtsi
++++ b/arch/arm64/boot/dts/apple/t8015-pmgr.dtsi
+@@ -129,12 +129,13 @@
+ 		apple,always-on; /* Core device */
+ 	};
+ 
+-	ps_pcie_ref: power-controller@80148 {
++	ps_pcie_ref: clock-controller@80148 {
+ 		compatible = "apple,t8015-pmgr-pwrstate", "apple,pmgr-pwrstate";
+ 		reg = <0x80148 4>;
+-		#power-domain-cells = <0>;
+-		#reset-cells = <0>;
++		#clock-cells = <0>;
+ 		label = "pcie_ref";
++		apple,clock-gate-only;
++		apple,manual-pm;
+ 	};
+ 
+ 	ps_mca0: power-controller@80170 {
+@@ -658,15 +659,17 @@
+ 		#power-domain-cells = <0>;
+ 		#reset-cells = <0>;
+ 		label = "pcie";
+-		power-domains = <&ps_pcie_aux>, <&ps_pcie_direct>, <&ps_pcie_ref>;
++		power-domains = <&ps_pcie_direct>;
++		apple,manual-pm;
+ 	};
+ 
+-	ps_pcie_aux: power-controller@80320 {
++	ps_pcie_aux: clock-controller@80320 {
+ 		compatible = "apple,t8015-pmgr-pwrstate", "apple,pmgr-pwrstate";
+ 		reg = <0x80320 4>;
+-		#power-domain-cells = <0>;
+-		#reset-cells = <0>;
++		#clock-cells = <0>;
+ 		label = "pcie_aux";
++		apple,clock-gate-only;
++		apple,manual-pm;
+ 	};
+ 
+ 	ps_vdec0: power-controller@80388 {

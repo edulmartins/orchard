@@ -1,0 +1,24 @@
+From 98304f20779a75f37749cd7f5523d1c0cbbeaf45 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:28:26 -0500
+Subject: [PATCH] dt-bindings: iommu: apple-dart: Add the T8015 compatible
+
+The T8015 DARTs use the same s5l8960x register programming as the T7000,
+S8000 and T8010, but the fallback enum does not list a T8015 compatible.
+Add it so the SoC can use the existing driver and quirk data.
+---
+ Documentation/devicetree/bindings/iommu/apple,dart.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/iommu/apple,dart.yaml b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+index 95f4843..df72722 100644
+--- a/Documentation/devicetree/bindings/iommu/apple,dart.yaml
++++ b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+@@ -37,6 +37,7 @@ properties:
+               - apple,t7000-dart
+               - apple,s8000-dart
+               - apple,t8010-dart
++              - apple,t8015-dart
+           - const: apple,s5l8960x-dart
+ 
+   reg:

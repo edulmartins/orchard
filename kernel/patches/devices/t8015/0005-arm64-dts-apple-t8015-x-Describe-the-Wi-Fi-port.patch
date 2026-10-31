@@ -1,0 +1,56 @@
+From 55256a1421276d5b62422529b7dbe177c56e3c34 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:29:34 -0500
+Subject: [PATCH] arm64: dts: apple: t8015-x: Describe the Wi-Fi port
+
+The iPhone X has a BCM4357 on APCIE port 3. The runtime ADT gives the
+port's CLKREQ# as GPIO 163, PERST# as GPIO 167 and the device-wake line
+as GPIO 40. The port's secondary bus is 3, which is also the bus in the
+iommu-map entry, and the device's DART is dart-apcie3.
+
+Keep the port and the DART disabled: the Wi-Fi cannot bind until the
+h9p driver knows the T8015 and the BCM4357 is described. The PCI ID is
+the BCM43570's 0x43d9; the actual BCM4357 ID is still unconfirmed.
+---
+ arch/arm64/boot/dts/apple/t8015-x.dtsi | 31 ++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015-x.dtsi b/arch/arm64/boot/dts/apple/t8015-x.dtsi
+index 41134ed..f19f405 100644
+--- a/arch/arm64/boot/dts/apple/t8015-x.dtsi
++++ b/arch/arm64/boot/dts/apple/t8015-x.dtsi
+@@ -11,3 +11,34 @@
+ / {
+ 	chassis-type = "handset";
+ };
++
++&apcie {
++	iommu-map = <0x300 &dart_apcie3 0 0x0 0x80000000 0x0 0x3ffff000 1>;
++	pinctrl-0 = <&wifi_clkreq>;
++	pinctrl-names = "default";
++
++	pci@3,0 {
++		device_type = "pci";
++		reg = <0x1800 0x0 0x0 0x0 0x0>;
++		bus-range = <3 3>;
++		max-link-speed = <2>;
++		apple,manual-availability-iommu = <&dart_apcie3 0>;
++		reset-gpios = <&pinctrl_ap 167 GPIO_ACTIVE_LOW>;
++
++		#address-cells = <3>;
++		#size-cells = <2>;
++		ranges;
++
++		wifi: wifi@0,0 {
++			compatible = "pci14e4,43d9";
++			reg = <0x30000 0x0 0x0 0x0 0x0>;
++			device-wake-gpios = <&pinctrl_ap 40 GPIO_ACTIVE_HIGH>;
++		};
++	};
++};
++
++&pinctrl_ap {
++	wifi_clkreq: wifi-clkreq-pins {
++		pinmux = <APPLE_PINMUX(163, 1)>;
++	};
++};
