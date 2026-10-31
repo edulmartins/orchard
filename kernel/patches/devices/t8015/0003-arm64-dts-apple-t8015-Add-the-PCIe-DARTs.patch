@@ -1,18 +1,20 @@
-From 00f3c459cce0a2a5f527ee8ead92164edaef897d Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
-Date: Sat, 31 Oct 2026 14:37:48 -0500
+Date: Sat, 31 Oct 2026 16:40:31 -0500
 Subject: [PATCH] arm64: dts: apple: t8015: Add the PCIe DARTs
 
-The APCIE root complex has one DART per port. The runtime ADT describes
-dart-apcie2 and dart-apcie3 at 0x603008000 and 0x604008000, with one
-interrupt each (347 and 350) and a 0x3ffff000 vm-size.
+The APCIE root complex has two DARTs in the runtime ADT, dart-apcie2 and
+dart-apcie3 at 0x603008000 and 0x604008000, with one interrupt each (347
+and 350) and a 0x3ffff000 vm-size.
 
-Their dart-options, fetch-config and diag-config values match the
-s5l8960x generation, so describe them with the s5l8960x fallback and
-carry the ADT error-reflector, fetch-config and diag-config, as iOS
-programs them at every DART init.
+Their fetch-config matches the s5l8960x generation, so describe them with
+the s5l8960x fallback. Their diag-config is 0x80000100, which differs
+from the 0x00000100 of the s5l8960x, t7001 and s8003 DARTs; it and the
+error-reflector are carried as the ADT gives them.
 
 They stay disabled until the h9p PCIe driver knows the T8015.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
 ---
  arch/arm64/boot/dts/apple/t8015.dtsi | 28 ++++++++++++++++++++++++++++
  1 file changed, 28 insertions(+)
@@ -56,3 +58,6 @@ index 85ab9bf..3ddce22 100644
  		nvme@259cc0000 {
  			compatible = "apple,t8015-nvme-ans2";
  			reg = <0x2 0x59cc0000 0x0 0x40000>,
+-- 
+2.56.0
+

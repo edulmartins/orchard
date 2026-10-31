@@ -1,25 +1,31 @@
-From 97430e17fee834bdebc3030aa2b9932f88c9aaad Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
-Date: Sat, 31 Oct 2026 14:29:27 -0500
+Date: Sat, 31 Oct 2026 16:40:52 -0500
 Subject: [PATCH] arm64: dts: apple: t8015: Add the PCIe host bridge
 
-The A11 has the same four-port H8P/H9P root complex as the A10, but with
-a per-port NVMMU window and no storage port. The runtime ADT places the
-ECAM window at 0x610000000, the port registers at 0x60N000000 with their
-NVMMUs at 0x60N004000, and the PHY at 0x600080000. The four port state
+The A11 has the same four-port H8P/H9P root complex as the A10, but with a
+per-port NVMMU window and no storage port. The runtime ADT places the ECAM
+window at 0x610000000, the port registers at 0x60N000000 with a 0x4000
+window at 0x60N004000, and the PHY at 0x600080000. The four port state
 interrupts are 340/343/346/349, and the MSI block starts at 352.
 
-Describe the controller, but leave it disabled: the h9p driver still has
-no T8015 match data and no tunables.
+The ADT reg entries are unnamed, so the portN and portN-nvmmu names are
+this series' reading of that layout rather than ADT properties; the driver
+does not consume them yet.
+
+Describe the controller but leave it disabled: the h9p driver still has no
+T8015 match data and no tunables.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
 ---
  arch/arm64/boot/dts/apple/t8015.dtsi | 50 ++++++++++++++++++++++++++++
  1 file changed, 50 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/apple/t8015.dtsi b/arch/arm64/boot/dts/apple/t8015.dtsi
-index 723d4c7..8d5d72e 100644
+index 3ddce22..6f07e9a 100644
 --- a/arch/arm64/boot/dts/apple/t8015.dtsi
 +++ b/arch/arm64/boot/dts/apple/t8015.dtsi
-@@ -717,6 +717,56 @@
+@@ -725,6 +725,56 @@
  			power-domain-names = "ans", "apcie0";
  			resets = <&ps_ans2>;
  		};
@@ -76,3 +82,6 @@ index 723d4c7..8d5d72e 100644
  	};
  
  	timer {
+-- 
+2.56.0
+

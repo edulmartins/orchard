@@ -1,22 +1,26 @@
-From d8b62c2a2c8a60257a292cff6a90009aab8e130a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
-Date: Sat, 31 Oct 2026 14:29:12 -0500
-Subject: [PATCH] dt-bindings: PCI: apple-t8010-pcie: Add the T8015 variant
+Date: Sat, 31 Oct 2026 16:40:46 -0500
+Subject: [PATCH] dt-bindings: pci: apple,t8010-pcie: Add the T8015 variant
 
-The T8015 keeps the four-port H8P/H9P register map but gives each port
-its own NVMMU window (portN and portN-nvmmu) and has no storage port,
-so its NVMe controller is the separate ANS2 block. It therefore has
-twelve reg entries, four port interrupts and no storage-port NVMMU
-properties.
+The T8015 keeps the four-port H8P/H9P register map but gives each port its
+own NVMMU window (portN and portN-nvmmu) and has no storage port, so its
+NVMe controller is the separate ANS2 block. It therefore has twelve reg
+entries, four port interrupts, and none of the storage-port properties:
+no apple,nvmmu-iova and no apple,nvme-hmb.
 
 Describe that layout in the Apple PCIe binding so the T8015 node can be
-validated. The T8010 layout stays the default.
+validated. The per-SoC constraints become independent allOf entries so
+the T8010 branch keeps its nine-register and five-interrupt limits and
+the derivative boards still match it.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
 ---
- .../bindings/pci/apple,t8010-pcie.yaml        | 111 ++++++++++++------
- 1 file changed, 76 insertions(+), 35 deletions(-)
+ .../bindings/pci/apple,t8010-pcie.yaml        | 74 ++++++++++++++++---
+ 1 file changed, 63 insertions(+), 11 deletions(-)
 
 diff --git a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
-index 83db67f..6fa82fd 100644
+index 83db67f..e70f009 100644
 --- a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
 +++ b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
 @@ -4,17 +4,17 @@
@@ -54,100 +58,67 @@ index 83db67f..6fa82fd 100644
    Apple A8/A8X (T7000/T7001) devices use an earlier version of the same root
    complex, with the same ECAM layout, port register block and MSI block. It
    has no separate PHY register windows and no NVMMU, and its reference and
-@@ -66,31 +70,67 @@ allOf:
+@@ -65,11 +69,58 @@ allOf:
+         apple,nvmmu-iova: false
          apple,nvme-hmb: false
          apple,preinit-phy-port-mask: false
-     else:
--      properties:
--        reg:
--          minItems: 9
--        reg-names:
--          items:
--            - const: config
--            - const: rc
--            - const: phy
--            - const: phy-ip
--            - const: port0
--            - const: port1
--            - const: port2
--            - const: port3
--            - const: nvmmu
--        interrupts:
--          minItems: 5
--        interrupt-names:
--          minItems: 5
--        power-domains:
--          maxItems: 1
--      required:
--        - clocks
--        - clock-names
--        - apple,nvmmu-iova
--        - apple,nvme-hmb
-+      if:
+-    else:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: apple,t8015-pcie
++    then:
++      properties:
++        reg:
++          minItems: 12
++          maxItems: 12
++        reg-names:
++          items:
++            - const: config
++            - const: port0
++            - const: port0-nvmmu
++            - const: port1
++            - const: port1-nvmmu
++            - const: port2
++            - const: port2-nvmmu
++            - const: port3
++            - const: port3-nvmmu
++            - const: rc
++            - const: phy
++            - const: phy-ip
++        interrupts:
++          minItems: 4
++          maxItems: 4
++        interrupt-names:
++          minItems: 4
++          maxItems: 4
++        power-domains:
++          maxItems: 1
++        apple,nvmmu-iova: false
++        apple,nvme-hmb: false
++      required:
++        - clocks
++        - clock-names
++  - if:
++      not:
 +        properties:
 +          compatible:
 +            contains:
-+              const: apple,t8015-pcie
-+      then:
-+        properties:
-+          reg:
-+            minItems: 12
-+            maxItems: 12
-+          reg-names:
-+            items:
-+              - const: config
-+              - const: port0
-+              - const: port0-nvmmu
-+              - const: port1
-+              - const: port1-nvmmu
-+              - const: port2
-+              - const: port2-nvmmu
-+              - const: port3
-+              - const: port3-nvmmu
-+              - const: rc
-+              - const: phy
-+              - const: phy-ip
-+          interrupts:
-+            minItems: 4
-+            maxItems: 4
-+          interrupt-names:
-+            minItems: 4
-+            maxItems: 4
-+          power-domains:
-+            maxItems: 1
-+        required:
-+          - clocks
-+          - clock-names
-+      else:
-+        properties:
-+          reg:
-+            minItems: 9
-+          reg-names:
-+            items:
-+              - const: config
-+              - const: rc
-+              - const: phy
-+              - const: phy-ip
-+              - const: port0
-+              - const: port1
-+              - const: port2
-+              - const: port3
-+              - const: nvmmu
-+          interrupts:
-+            minItems: 5
-+          interrupt-names:
-+            minItems: 5
-+          power-domains:
-+            maxItems: 1
-+        required:
-+          - clocks
-+          - clock-names
-+          - apple,nvmmu-iova
-+          - apple,nvme-hmb
- 
- properties:
-   compatible:
-@@ -99,22 +139,23 @@ properties:
++              enum:
++                - apple,t7000-pcie
++                - apple,t8015-pcie
++    then:
+       properties:
+         reg:
+           minItems: 9
++          maxItems: 9
+         reg-names:
++          maxItems: 9
+           items:
+             - const: config
+             - const: rc
+@@ -99,22 +150,23 @@ properties:
            - apple,s8003-pcie
            - apple,t7000-pcie
            - apple,t8010-pcie
@@ -175,3 +146,6 @@ index 83db67f..6fa82fd 100644
      minItems: 4
      maxItems: 5
  
+-- 
+2.56.0
+
