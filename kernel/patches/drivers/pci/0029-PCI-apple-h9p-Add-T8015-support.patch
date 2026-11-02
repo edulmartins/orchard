@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 11:02:22 -0600
+Subject: [PATCH] PCI: apple-h9p: Add T8015 support
+
+The A11 keeps the H9P root complex but changes enough of it that the
+T8010 sequence cannot drive it: the common status register is 0x24
+(T8010's CTL2), the per-port root complex blocks move to
+0x4000 * (port + 1) with their own enable, status and reset bits, and
+there is no root-complex link-rate register. The target speed is the
+root port's LNKCTL2 field, limited to what the slot advertises in
+LNKCAP2, and a link that trains below it is retrained with the DWC
+direct-speed-change bit.
+
+The power-up order also differs. REFCLK and the root port's reset
+handshake are released in a different order, the port status block has
+to drain before the enable bit is set, and the reference clock must run
+for t-refclk-to-perst before the port-complex enable. Port 3 gets its
+own lane setup, as on T8010.
+
+The registers, the sequences and the tunables come from AppleT8015PCIe
+in the iPhone X's iOS 16.7.16 kernelcache and from the D221 runtime ADT.
+The T8015 has no storage port and a per-port NVMMU, so the driver
+programs no NVMMU for it.
+
+Not yet tested on hardware.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 454 +++++++++++++++++++++++-
+ 1 file changed, 451 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index e522379..5a17e21 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * PCIe host bridge driver for Apple H8P/H9P (S8003/T8010) and A8/A8X (T7000)
+- * SoCs.
++ * PCIe host bridge driver for Apple H8P/H9P (S8003/T8010/T8015) and A8/A8X
++ * (T7000) SoCs.
+  *
+  * The controller exposes an ECAM-compatible root complex after the SoC-specific
+  * power, clock and PHY sequence has brought a port out of reset. The hardware
+@@ -146,6 +146,64 @@
+ #define H9P_LINK_SPEED_5GT		2
+ #define H9P_LINK_SPEED_8GT		3
+ 
++/*
++ * T8015 (A11). It keeps T8010's CTL0 and CTL3, but its common status register
++ * is 0x24 -- T8010's CTL2 -- and the per-port root complex blocks move to
++ * 0x4000 * (port + 1) with the enable, status and reset bits at offsets of
++ * their own. The target speed is a standard LNKCTL2 field, so this SoC has no
++ * root complex link-rate register (iOS: AppleT8015PCIe in the iPhone X
++ * iOS 16.7.16 kernelcache, d221-adt.txt lines 9361-9498).
++ */
++#define T8015_RC_COMMON_CTL0		0x0004
++#define T8015_RC_COMMON_STAT		0x0024
++#define T8015_RC_COMMON_STAT_READY	BIT(0)
++#define T8015_RC_COMMON_STAT_INIT_DONE	BIT(4)
++/* Cleared at the end of the common init; purpose not decoded */
++#define T8015_RC_COMMON_CTL_30		0x0030
++#define T8015_RC_COMMON_CTL3		0x0034
++#define T8015_RC_PORT_STRIDE		0x4000
++#define T8015_RC_PORT_BLOCK(port)	(T8015_RC_PORT_STRIDE * ((port) + 1))
++#define T8015_RC_PORT_CTL0(port)	(T8015_RC_PORT_BLOCK(port) + 0x0000)
++#define T8015_RC_PORT_STAT(port)	(T8015_RC_PORT_BLOCK(port) + 0x0004)
++#define T8015_RC_PORT_CTL1(port)	(T8015_RC_PORT_BLOCK(port) + 0x0124)
++#define T8015_RC_PORT_CTL2(port)	(T8015_RC_PORT_BLOCK(port) + 0x0128)
++#define T8015_RC_PORT_CTL3(port)	(T8015_RC_PORT_BLOCK(port) + 0x0134)
++#define T8015_RC_PORT_CTL0_ENABLE	BIT(0)
++#define T8015_RC_PORT_CTL0_REFCLK	BIT(8)
++#define T8015_RC_PORT_CTL0_AUXCLK_AUTO_DIS	BIT(20)
++#define T8015_RC_PORT_CTL1_ENABLE	BIT(0)
++#define T8015_RC_PORT_CTL1_REFCLK_NOGATE	BIT(8)
++#define T8015_RC_PORT_CTL2_PIPE_RESET	BIT(4)
++#define T8015_RC_PORT_CTL3_ENABLE	BIT(0)
++#define T8015_RC_PORT_STAT_BUSY		BIT(0)
++/* Written for every port: link-state counter control */
++#define T8015_RC_PORT_LSCNT(port)	(0x40000 + (port) * 0x4000 + 0x0020)
++#define T8015_RC_PORT_LSCNT_ENABLE	3
++
++/* PHY-IP handshake after the common status reports ready */
++#define T8015_PHY_IP_PIPE_CTL0		0x0074
++#define T8015_PHY_IP_PIPE_CTL0_CLK	0x6
++#define T8015_PHY_IP_PIPE_CTL1		0x0134
++#define T8015_PHY_IP_PIPE_CTL1_CLK	0x10
++
++/* Port window: the pipe clock is running (same LINKSTS as T8010) */
++#define T8015_PORT_PIPE_CLK		BIT(2)
++
++/* DWC config-space registers: the x1 lane width and the retrain request */
++#define T8015_DWC_LINK_CTL		0x0710
++#define T8015_DWC_LINK_CTL_X1		BIT(16)
++#define T8015_DWC_GEN2_CTL		0x080c
++#define T8015_DWC_GEN2_CTL_X1		BIT(8)
++#define T8015_DWC_GEN2_CTL_RETRAIN	BIT(17)
++#define T8015_DWC_PORT3_CTL		0x08bc
++#define T8015_DWC_PORT3_CTL_SET		BIT(0)
++#define T8015_DWC_PORT3_X1		0x0154
++#define T8015_DWC_PORT3_X1_VALUE	0x44444444
++/* d221's t-refclk-to-perst; iOS delays between REFCLK and PERST# */
++#define T8015_REFCLK_TO_PERST_US	100
++#define T8015_READY_TIMEOUT_US		250000
++#define T8015_LINK_RETRAIN_TIMEOUT_US	100000
++
+ /*
+  * S8003 (A9, TSMC). The register map is T8010's, but iOS
+  * (AppleS800xPCIe/AppleS8003PCIe in the iPad6,11 iOS 16.7.10 kernelcache,
+@@ -432,6 +490,84 @@ static const struct apple_h9p_tunable s8003_port_tunables[] = {
+ 	{ 0x0140, 0x0073ffff, 0x00704c4b },
+ };
+ 
++/*
++ * T8015 tunables, from the d221 runtime ADT. apcie-phy-tunables go to the
++ * "phy" window, apcie-common-tunables to the root complex window,
++ * pcie-rc-tunables to the root port's configuration space and
++ * apcie-config-tunables to the port block.
++ */
++static const struct apple_h9p_tunable t8015_phy_tunables[] = {
++	{ 0x0000, 0x00003000, 0x00002000 },
++	{ 0x0814, 0x00000001, 0x00000001 },
++	{ 0x08dc, 0x00000001, 0x00000001 },
++	{ 0x08ec, 0x00000001, 0x00000001 },
++	{ 0x08fc, 0x0000000f, 0x0000000f },
++	{ 0x090c, 0x00000007, 0x00000000 },
++	{ 0x091c, 0x0000001f, 0x00000006 },
++	{ 0x092c, 0x000000ff, 0x00000000 },
++	{ 0x0934, 0x00000007, 0x00000003 },
++	{ 0x0814, 0x00000001, 0x00000001 },
++	{ 0x08dc, 0x00000001, 0x00000000 },
++	{ 0x08ec, 0x00000001, 0x00000000 },
++	{ 0x08fc, 0x0000000f, 0x00000000 },
++	{ 0x090c, 0x00000007, 0x00000000 },
++	{ 0x091c, 0x0000001f, 0x00000000 },
++	{ 0x092c, 0x000000ff, 0x00000000 },
++	{ 0x0934, 0x00000007, 0x00000003 },
++	{ 0x0000, 0x00003000, 0x00001000 },
++};
++
++static const struct apple_h9p_tunable t8015_rc_common_tunables[] = {
++	{ 0x0008, 0x7f7f7f7f, 0x00000000 },
++	{ 0x000c, 0x00073f3f, 0x00043f00 },
++	{ 0x0010, 0x00000700, 0x00000000 },
++	{ 0x0018, 0x00ffffff, 0x000c0800 },
++	{ 0x001c, 0x00001fff, 0x0000092c },
++	{ 0x0028, 0x000000ff, 0x00000009 },
++	{ 0x4000, 0x31100010, 0x21000000 },
++	{ 0x4008, 0x00000707, 0x00000000 },
++	{ 0x400c, 0x00073f3f, 0x00043f00 },
++	{ 0x4014, 0x00000111, 0x00000010 },
++	{ 0x4120, 0x0333003f, 0x0111000f },
++	{ 0x4130, 0x000000ff, 0x0000000f },
++	{ 0x4138, 0x000001ff, 0x000000f2 },
++	{ 0x8000, 0x31100010, 0x21000000 },
++	{ 0x8008, 0x00000707, 0x00000000 },
++	{ 0x800c, 0x00073f3f, 0x00043f00 },
++	{ 0x8120, 0x0333003f, 0x0111000f },
++	{ 0x8130, 0x000000ff, 0x0000000f },
++	{ 0x8138, 0x000001ff, 0x000000f2 },
++	{ 0xc000, 0x31100010, 0x21000000 },
++	{ 0xc008, 0x00000707, 0x00000000 },
++	{ 0xc00c, 0x00073f3f, 0x00043f00 },
++	{ 0xc120, 0x0333003f, 0x0111000f },
++	{ 0xc130, 0x000000ff, 0x0000000f },
++	{ 0xc138, 0x000001ff, 0x000000f2 },
++	{ 0x10000, 0x31100010, 0x21000000 },
++	{ 0x10008, 0x00000707, 0x00000000 },
++	{ 0x1000c, 0x00073f3f, 0x00043f00 },
++	{ 0x10120, 0x0333003f, 0x0111000f },
++	{ 0x10130, 0x000000ff, 0x0000000f },
++	{ 0x10138, 0x000001ff, 0x000000f2 },
++};
++
++static const struct apple_h9p_tunable t8015_config_tunables[] = {
++	{ 0x0098, 0x0000000f, 0x00000000 },
++	{ 0x0164, 0x00f8ff1f, 0x0000001f },
++	{ 0x0890, 0x00000201, 0x00000200 },
++	{ 0x08e0, 0x00000005, 0x00000005 },
++	{ 0x0890, 0x00000201, 0x00000200 },
++};
++
++static const struct apple_h9p_tunable t8015_port_tunables[] = {
++	{ 0x0090, 0xffffffff, 0x0003a980 },
++	{ 0x0130, 0x0000000f, 0x00000007 },
++	{ 0x0134, 0x00000001, 0x00000001 },
++	{ 0x0138, 0x00007f7f, 0x00000000 },
++	{ 0x013c, 0x00000003, 0x00000002 },
++	{ 0x0140, 0x8073ffff, 0x00703d09 },
++};
++
+ struct apple_h9p_tunables {
+ 	const struct apple_h9p_tunable *regs;
+ 	unsigned int count;
+@@ -2014,6 +2150,284 @@ static int apple_t8010_setup_common(struct apple_h9p_pcie *pcie)
+ 	return 0;
+ }
+ 
++/*
++ * AppleT8015PCIe's initCommon: the lane configuration and the PHY tunables
++ * first, then the port-complex enable, then the common tunables. The D221
++ * ADT's lane-cfg is 0, so only the INIT bit is written.
++ */
++static int apple_t8015_setup_common(struct apple_h9p_pcie *pcie)
++{
++	int ret;
++
++	dev_info(pcie->dev, "DBG t8015: ctl0 write\n");
++	writel(H9P_RC_COMMON_CTL_INIT, pcie->base_rc + T8015_RC_COMMON_CTL0);
++
++	dev_info(pcie->dev, "DBG t8015: phy tunables\n");
++	apple_h9p_apply_tunable_set(pcie->base_phy, &pcie->hw->phy_tunables);
++
++	dev_info(pcie->dev, "DBG t8015: ctl3 write\n");
++	writel(H9P_RC_COMMON_CTL_ENABLE, pcie->base_rc + T8015_RC_COMMON_CTL3);
++
++	dev_info(pcie->dev, "DBG t8015: wait ready\n");
++	ret = apple_h9p_wait(pcie->base_rc + T8015_RC_COMMON_STAT,
++			     T8015_RC_COMMON_STAT_READY,
++			     T8015_RC_COMMON_STAT_READY,
++			     T8015_RC_COMMON_STAT_READY,
++			     T8015_READY_TIMEOUT_US);
++	if (ret)
++		return dev_err_probe(pcie->dev, ret,
++				     "global PHY ready timeout\n");
++	dev_info(pcie->dev, "DBG t8015: ready\n");
++
++	dev_info(pcie->dev, "DBG t8015: phy-ip ctl0\n");
++	h9p_rmw(pcie->base_phy_ip + T8015_PHY_IP_PIPE_CTL0, 0,
++		T8015_PHY_IP_PIPE_CTL0_CLK);
++	usleep_range(100, 200);
++	dev_info(pcie->dev, "DBG t8015: phy-ip ctl1\n");
++	h9p_rmw(pcie->base_phy_ip + T8015_PHY_IP_PIPE_CTL1, 0,
++		T8015_PHY_IP_PIPE_CTL1_CLK);
++
++	dev_info(pcie->dev, "DBG t8015: common tunables\n");
++	apple_h9p_apply_tunable_set(pcie->base_rc,
++				    &pcie->hw->common_tunables);
++
++	dev_info(pcie->dev, "DBG t8015: ctl 0x30\n");
++	h9p_rmw(pcie->base_rc + T8015_RC_COMMON_CTL_30, BIT(0), 0);
++
++	dev_info(pcie->dev, "DBG t8015: setup_common end\n");
++	return 0;
++}
++
++/*
++ * AppleT8015PCIe::enablePortHardware up to the pipe clock. Unlike T8010 the
++ * REFCLK bit is cleared before the port is enabled, and the port's status
++ * block has to drain before the enable bit is set.
++ *
++ * iOS also honours the muxed-auxclk-auto-dis and appclk-auto-dis ADT
++ * properties here; D221 has neither, which is the path taken.
++ */
++static int apple_t8015_enable_rc_port(struct apple_h9p_pcie *pcie,
++				      unsigned int port)
++{
++	void __iomem *rc = pcie->base_rc;
++	int ret;
++
++	dev_info(pcie->dev, "DBG erc %u: ctl3/ctl1\n", port);
++	h9p_rmw(rc + T8015_RC_PORT_CTL3(port), T8015_RC_PORT_CTL3_ENABLE, 0);
++	h9p_rmw(rc + T8015_RC_PORT_CTL1(port), 0, T8015_RC_PORT_CTL1_ENABLE);
++
++	dev_info(pcie->dev, "DBG erc %u: wait init_done\n", port);
++	ret = apple_h9p_wait(rc + T8015_RC_COMMON_STAT,
++			     T8015_RC_COMMON_STAT_INIT_DONE,
++			     T8015_RC_COMMON_STAT_INIT_DONE,
++			     T8015_RC_COMMON_STAT_INIT_DONE,
++			     T8015_READY_TIMEOUT_US);
++	if (ret)
++		return ret;
++
++	usleep_range(100, 200);
++
++	dev_info(pcie->dev, "DBG erc %u: refclk/pipe reset\n", port);
++	h9p_rmw(rc + T8015_RC_PORT_CTL0(port), T8015_RC_PORT_CTL0_REFCLK, 0);
++	h9p_rmw(rc + T8015_RC_PORT_CTL2(port), T8015_RC_PORT_CTL2_PIPE_RESET, 0);
++
++	ret = apple_h9p_wait(rc + T8015_RC_PORT_STAT(port),
++			     T8015_RC_PORT_STAT_BUSY, 0, 0,
++			     T8015_READY_TIMEOUT_US);
++	if (ret)
++		return ret;
++	dev_info(pcie->dev, "DBG erc %u: port stat idle\n", port);
++
++	ret = apple_h9p_wait(rc + T8015_RC_COMMON_STAT,
++			     T8015_RC_COMMON_STAT_READY,
++			     T8015_RC_COMMON_STAT_READY,
++			     T8015_RC_COMMON_STAT_READY,
++			     T8015_READY_TIMEOUT_US);
++	if (ret)
++		return ret;
++	dev_info(pcie->dev, "DBG erc %u: rc ready\n", port);
++
++	h9p_rmw(rc + T8015_RC_PORT_CTL0(port), 0, T8015_RC_PORT_CTL0_ENABLE);
++	usleep_range(T8015_REFCLK_TO_PERST_US, T8015_REFCLK_TO_PERST_US + 100);
++	h9p_rmw(rc + T8015_RC_PORT_CTL3(port), 0, T8015_RC_PORT_CTL3_ENABLE);
++	dev_info(pcie->dev, "DBG erc %u: port enabled\n", port);
++
++	ret = apple_h9p_wait(pcie->base_port[port] + H9P_PORT_LINKSTS,
++			     T8015_PORT_PIPE_CLK, T8015_PORT_PIPE_CLK,
++			     T8015_PORT_PIPE_CLK, T8015_READY_TIMEOUT_US);
++	if (ret)
++		return ret;
++	dev_info(pcie->dev, "DBG erc %u: pipe clk\n", port);
++
++	h9p_rmw(rc + T8015_RC_PORT_CTL1(port),
++		T8015_RC_PORT_CTL1_REFCLK_NOGATE, 0);
++
++	return 0;
++}
++
++/*
++ * iOS retrains a link that came up below the port's maximum-link-speed with
++ * the DWC direct-speed-change bit, then waits up to 100 ms for it.
++ */
++static void apple_t8015_retrain_link(struct apple_h9p_pcie *pcie,
++				     unsigned int port, u64 cap)
++{
++	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
++	u32 target = pcie->max_link_speed[port] ?:
++		pcie->hw->default_link_speed;
++	ktime_t timeout = ktime_add_us(ktime_get(),
++				       T8015_LINK_RETRAIN_TIMEOUT_US);
++	u16 lnksta;
++
++	if (!cap)
++		return;
++
++	lnksta = readw(config + cap + PCI_EXP_LNKSTA);
++	if (FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta) >= target)
++		return;
++
++	h9p_rmw(config + T8015_DWC_GEN2_CTL, 0, T8015_DWC_GEN2_CTL_RETRAIN);
++
++	do {
++		lnksta = readw(config + cap + PCI_EXP_LNKSTA);
++		if (FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta) >= target)
++			return;
++		usleep_range(1000, 2000);
++	} while (ktime_before(ktime_get(), timeout));
++
++	dev_warn(pcie->dev, "port %u trained at %lu, target %u\n", port,
++		 FIELD_GET(PCI_EXP_LNKSTA_CLS, lnksta), target);
++}
++
++static int apple_t8015_setup_port(struct apple_h9p_pcie *pcie, unsigned int port,
++				  enum apple_h9p_port_result *result)
++{
++	struct device *dev = pcie->dev;
++	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
++	void __iomem *base = pcie->base_port[port];
++	u32 speed, linksts;
++	u64 cap;
++	int ret;
++
++	*result = APPLE_H9P_PORT_READY;
++	if (apple_h9p_link_up(pcie, port))
++		return 0;
++
++	dev_info(dev, "DBG port %u: start\n", port);
++	if (pcie->inherited_perst_pending & BIT(port)) {
++		pcie->inherited_perst_pending &= ~BIT(port);
++	} else {
++		ret = gpiod_direction_output(pcie->perst[port], 1);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to assert port %u PERST#\n",
++					     port);
++		usleep_range(250, 1000);
++	}
++	dev_info(dev, "DBG port %u: perst asserted\n", port);
++
++	ret = apple_t8015_enable_rc_port(pcie, port);
++	if (ret)
++		return dev_err_probe(dev, ret, "port %u init timeout\n", port);
++	dev_info(dev, "DBG port %u: rc enabled\n", port);
++
++	if (pcie->manual_dart[port]) {
++		ret = apple_dart_reload_configuration(pcie->manual_dart[port],
++						      pcie->manual_dart_sid[port]);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to reload port %u DART\n",
++					     port);
++	}
++
++	apple_h9p_apply_tunable_set(base, &pcie->hw->port_tunables);
++	dev_info(dev, "DBG port %u: tunables\n", port);
++
++	cap = apple_h9p_read_pci_cap(pcie, port << 3, PCI_CAP_ID_EXP);
++	dev_info(dev, "DBG port %u: cap=%#llx\n", port, cap);
++	if (!cap) {
++		linksts = readl(base + H9P_PORT_LINKSTS);
++		ret = -ENODEV;
++		goto disable_port;
++	}
++	pcie->pcie_cap[port] = cap;
++
++	apple_h9p_apply_tunable_set(config, &pcie->hw->config_tunables);
++
++	/* The target speed is LNKCTL2's, limited to what the slot advertises. */
++	speed = pcie->max_link_speed[port] ?: pcie->hw->default_link_speed;
++	if (readl(config + cap + PCI_EXP_LNKCAP2) & BIT(speed))
++		h9p_rmww(config + cap + PCI_EXP_LNKCTL2,
++			 PCI_EXP_LNKCTL2_TLS, speed);
++	else
++		dev_warn(dev, "port %u does not advertise speed %u\n",
++			 port, speed);
++
++	/* Every port is a single lane; port 3 also needs its own lane setup. */
++	h9p_rmw(config + T8015_DWC_LINK_CTL, 0, T8015_DWC_LINK_CTL_X1);
++	h9p_rmw(config + T8015_DWC_GEN2_CTL, 0, T8015_DWC_GEN2_CTL_X1);
++	if (port == 3) {
++		h9p_rmw(config + T8015_DWC_PORT3_CTL, 0,
++			T8015_DWC_PORT3_CTL_SET);
++		writel(T8015_DWC_PORT3_X1_VALUE,
++		       config + T8015_DWC_PORT3_X1);
++		h9p_rmw(config + T8015_DWC_PORT3_CTL,
++			T8015_DWC_PORT3_CTL_SET, 0);
++	}
++
++	dev_info(dev, "DBG port %u: lanes\n", port);
++	writel(T8015_RC_PORT_LSCNT_ENABLE,
++	       pcie->base_rc + T8015_RC_PORT_LSCNT(port));
++	dev_info(dev, "DBG port %u: lscnt\n", port);
++
++	if (port == 3) {
++		apple_h9p_arm_port_irq(pcie, port);
++	} else {
++		writel(H9P_PORT_IRQMASK_PRE_LINK, base + H9P_PORT_IRQMASK);
++		writel(H9P_PORT_IRQSTAT_PRE_LINK, base + H9P_PORT_IRQSTAT);
++	}
++
++	h9p_rmw(base + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
++	dev_info(dev, "DBG port %u: enabled\n", port);
++	writel(H9P_PORT_MSICTL_INIT, base + H9P_PORT_MSICTL);
++	writel(port * 0x10001 * H9P_MSI_PER_PORT,
++	       base + H9P_PORT_MSIVECBASE);
++	dev_info(dev, "DBG port %u: msi cfg\n", port);
++
++	ret = gpiod_direction_output(pcie->perst[port], 0);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to deassert port %u PERST#\n",
++				     port);
++	dev_info(dev, "DBG port %u: perst released\n", port);
++
++	h9p_rmw(base + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
++	dev_info(dev, "DBG port %u: ltssm on\n", port);
++	ret = apple_h9p_wait_link(pcie, port, &linksts);
++	dev_info(dev, "DBG port %u: wait_link %d linksts=%#x\n",
++		 port, ret, linksts);
++	if (ret) {
++		dev_warn(dev,
++			 "port %u link did not reach L0 (linksts=%#x)\n",
++			 port, linksts);
++		*result = APPLE_H9P_PORT_LINK_FAILED;
++	} else {
++		writel(H9P_PORT_IRQMASK_LINK_UP, base + H9P_PORT_IRQMASK);
++		apple_t8015_retrain_link(pcie, port, cap);
++	}
++
++	return 0;
++
++disable_port:
++	if (port == 3)
++		apple_h9p_disable_port_irq(pcie, port);
++	dev_warn(dev,
++		 "disabling port %u after setup failed: %d (linksts=%#x)\n",
++		 port, ret, linksts);
++	*result = APPLE_H9P_PORT_DISABLED;
++	return 0;
++}
++
+ /* Read-modify-write every entry, as iOS does, even when it already matches. */
+ static void apple_t7000_write_tunables(void __iomem *base,
+ 				       const struct apple_h9p_tunable *tunables,
+@@ -2434,7 +2848,7 @@ static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
+ 	void __iomem *pb = pcie->base_port[port];
+ 	struct device *dev = pcie->dev;
+ 	u32 lanes = apple_s8003_lanes(pcie, port);
+-	u32 speed = pcie->max_link_speed[port] ?: H9P_LINK_SPEED_2_5GT;
++	u32 speed = pcie->max_link_speed[port] ?: pcie->hw->default_link_speed;
+ 	u32 val, lnkcap2;
+ 	u64 cap;
+ 	int ret;
+@@ -3058,6 +3472,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	ret = apple_h9p_pcie_parse_ports(pcie);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to parse root ports\n");
++	dev_info(dev, "DBG probe: ports parsed\n");
+ 
+ 	if (pcie->hw->parse) {
+ 		ret = pcie->hw->parse(pcie);
+@@ -3068,6 +3483,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	ret = apple_h9p_pcie_map_resources(pdev, pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: resources mapped\n");
+ 
+ 	ret = pci_pwrctrl_create_devices(dev);
+ 	if (ret)
+@@ -3089,10 +3505,12 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 			return dev_err_probe(dev, ret,
+ 					     "waiting for PCI power controls\n");
+ 	}
++	dev_info(dev, "DBG probe: pwrctrl ready\n");
+ 
+ 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
++	dev_info(dev, "DBG probe: dma mask\n");
+ 
+ 	if (pcie->hw->has_clocks) {
+ 		pcie->clks[0].id = "aux";
+@@ -3103,6 +3521,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 			return dev_err_probe(dev, ret,
+ 					     "failed to get clocks\n");
+ 	}
++	dev_info(dev, "DBG probe: clocks got\n");
+ 
+ 	ret = apple_h9p_pcie_attach_genpd(pcie);
+ 	if (ret)
+@@ -3110,6 +3529,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_genpd_cleanup, pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: genpd attached\n");
+ 
+ 	while (pcie->hw->has_clocks &&
+ 	       pcie->clks_enabled < ARRAY_SIZE(pcie->clks)) {
+@@ -3131,6 +3551,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_clk_cleanup, pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: clocks enabled\n");
+ 
+ 	pcie->pinctrl = devm_pinctrl_get_select_default(dev);
+ 	if (PTR_ERR(pcie->pinctrl) == -ENODEV)
+@@ -3138,24 +3559,30 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	else if (IS_ERR(pcie->pinctrl))
+ 		return dev_err_probe(dev, PTR_ERR(pcie->pinctrl),
+ 				     "failed to select pinctrl state\n");
++	dev_info(dev, "DBG probe: pinctrl\n");
+ 
+ 	ret = apple_h9p_pcie_get_gpios(pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: gpios\n");
+ 
+ 	ret = apple_h9p_pcie_request_port_irqs(pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: irqs\n");
+ 
+ 	if (pcie->hw->setup_common) {
++		dev_info(dev, "DBG probe: setup_common start\n");
+ 		ret = pcie->hw->setup_common(pcie);
+ 		if (ret)
+ 			return ret;
++		dev_info(dev, "DBG probe: setup_common done\n");
+ 	}
+ 
+ 	ret = apple_h9p_prepare_phy_ports(pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: phy ports prepared\n");
+ 
+ 	if (!pcie->deferred_power_ports && !pcie->hw->setup_ports) {
+ 		ret = pci_pwrctrl_power_on_devices(dev);
+@@ -3170,12 +3597,15 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	if (!of_property_read_u32(dev->of_node, "apple,msi-doorbell", &doorbell))
+ 		pcie->msi_doorbell = doorbell;
+ 
++	dev_info(dev, "DBG probe: pwrctrl powered\n");
++
+ 	ret = apple_h9p_pcie_setup_msi(pcie);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to set up MSI\n");
+ 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_msi_cleanup, pcie);
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "DBG probe: msi done\n");
+ 
+ 	INIT_DELAYED_WORK(&pcie->late_work, apple_s8003_late_ports_work);
+ 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_cancel_late_ports,
+@@ -3221,6 +3651,23 @@ static const struct apple_h9p_hw apple_h9p_hw_j172 = {
+ 	.j172_bridge_quirk = true,
+ };
+ 
++/*
++ * The T8015 has a per-port NVMMU window and no storage port, so the
++ * controller has no NVMMU for this driver to program and the per-port
++ * interrupts are left to the generic path.
++ */
++static const struct apple_h9p_hw apple_h9p_hw_t8015 = {
++	.setup_common = apple_t8015_setup_common,
++	.setup_port = apple_t8015_setup_port,
++	.default_link_speed = H9P_LINK_SPEED_2_5GT,
++	.has_clocks = true,
++	.has_phy = true,
++	.phy_tunables = H9P_TUNABLES(t8015_phy_tunables),
++	.common_tunables = H9P_TUNABLES(t8015_rc_common_tunables),
++	.config_tunables = H9P_TUNABLES(t8015_config_tunables),
++	.port_tunables = H9P_TUNABLES(t8015_port_tunables),
++};
++
+ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
+ 	.parse = apple_s8003_parse,
+ 	.setup_common = apple_s8003_setup_common,
+@@ -3243,6 +3690,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
+ static const struct of_device_id apple_h9p_pcie_of_match[] = {
+ 	{ .compatible = "apple,s8003-pcie", .data = &apple_h9p_hw_s8003 },
+ 	{ .compatible = "apple,j172-pcie", .data = &apple_h9p_hw_j172 },
++	{ .compatible = "apple,t8015-pcie", .data = &apple_h9p_hw_t8015 },
+ 	{ .compatible = "apple,t8010-pcie", .data = &apple_h9p_hw_t8010 },
+ 	{ .compatible = "apple,t7000-pcie", .data = &apple_h9p_hw_t7000 },
+ 	{ }
+-- 
+2.56.0
+
