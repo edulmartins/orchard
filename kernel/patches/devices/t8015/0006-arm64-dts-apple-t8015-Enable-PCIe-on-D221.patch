@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 11:00:00 -0600
+Subject: [PATCH] arm64: dts: apple: t8015: Enable the PCIe controller on the D221
+
+TEST ONLY. The held PCIe series describes the controller but leaves it
+disabled until the h9p T8015 support is tested on hardware. This enables
+it on the iPhone X so the boot test can exercise port 3.
+
+The Wi-Fi port's DART must be enabled as well: the h9p driver reloads its
+configuration by hand, and a disabled DART node has no platform device to
+find, which the driver reports as a silent -EPROBE_DEFER.
+
+Not for submission: drop it once the T8015 series is enabled.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+---
+ arch/arm64/boot/dts/apple/t8015-d221.dts | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015-d221.dts b/arch/arm64/boot/dts/apple/t8015-d221.dts
+--- a/arch/arm64/boot/dts/apple/t8015-d221.dts
++++ b/arch/arm64/boot/dts/apple/t8015-d221.dts
+@@ -12,3 +12,11 @@
+ 	compatible = "apple,d221", "apple,t8015", "apple,arm-platform";
+ 	model = "Apple iPhone X (GSM)";
+ };
++
++&apcie {
++	status = "okay";
++};
++
++&dart_apcie3 {
++	status = "okay";
++};

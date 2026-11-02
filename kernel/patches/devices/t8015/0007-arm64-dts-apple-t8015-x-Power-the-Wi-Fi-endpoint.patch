@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 13:10:00 -0600
+Subject: [PATCH] arm64: dts: apple: t8015-x: Power the Wi-Fi endpoint
+
+TEST ONLY. The D221 runtime ADT powers the BCM4357 through SMC PMU GPIO
+14 ("gP0e") and drives the device-wake line on AP GPIO 40. Without that
+rail the endpoint never answers PERST# and the port's LTSSM stays in
+Detect.Quiet.
+
+The active level of gP0e is unverified: every other Apple Wi-Fi REG_ON
+in this tree is active-high, and so is the Broadcom WL_REG_ON, but the
+ADT's command word for this key reads as a plain 0. Start active-high
+and flip only if the port's LTSSM never leaves Detect.Quiet.
+
+Model the rail as a fixed regulator on the SMC PMU GPIO and give the
+endpoint a pci-pwrctrl node, which apple-h9p powers before it sets up
+the port. The t8015 SMC has no apple,smc-gpio child yet, so add it here.
+
+The endpoint uses the j172 power-control data: the BCM4357's own PCI ID
+is still unknown, so the node claims pci14e4,43dc to bind the pwrctrl
+driver. Not for submission.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/apple/t8015-x.dtsi | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015-x.dtsi b/arch/arm64/boot/dts/apple/t8015-x.dtsi
+--- a/arch/arm64/boot/dts/apple/t8015-x.dtsi
++++ b/arch/arm64/boot/dts/apple/t8015-x.dtsi
+@@ -10,6 +10,20 @@
+ 
+ / {
+ 	chassis-type = "handset";
++
++	/*
++	 * TEST ONLY: the BCM4357's REG_ON is driven through the SMC PMU
++	 * GPIO 14 ("gP0e"). The active level is unverified. gpiolib forces
++	 * the polarity from enable-active-high and ignores the phandle
++	 * flags, so that property alone decides the physical level.
++	 */
++	wlan_vdd: regulator-wlan-vdd {
++		compatible = "regulator-fixed";
++		regulator-name = "wlan-vdd";
++		gpio = <&smc_gpio 14 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		off-on-delay-us = <2500>;
++	};
+ };
+ 
+ &apcie {
+@@ -29,6 +43,13 @@
+ 		#address-cells = <3>;
+ 		#size-cells = <2>;
+ 		ranges;
++
++		wifi@0,0 {
++			compatible = "apple,d221-bcm4357-wifi", "pci14e4,43dc";
++			reg = <0x10000 0x0 0x0 0x0 0x0>;
++			device-wake-gpios = <&pinctrl_ap 40 GPIO_ACTIVE_HIGH>;
++			vdd-supply = <&wlan_vdd>;
++		};
+ 	};
+ };
+ 
+@@ -37,3 +58,11 @@
+ 		pinmux = <APPLE_PINMUX(163, 1)>;
+ 	};
+ };
++
++&smc {
++	smc_gpio: gpio {
++		compatible = "apple,smc-gpio";
++		gpio-controller;
++		#gpio-cells = <2>;
++	};
++};
+-- 
+2.56.0
+

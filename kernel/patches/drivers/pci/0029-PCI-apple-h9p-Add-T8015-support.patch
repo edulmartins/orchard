@@ -27,11 +27,11 @@ Not yet tested on hardware.
 
 Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
 ---
- drivers/pci/controller/pcie-apple-h9p.c | 454 +++++++++++++++++++++++-
- 1 file changed, 451 insertions(+), 3 deletions(-)
+ drivers/pci/controller/pcie-apple-h9p.c | 487 +++++++++++++++++++++++++++++++-
+ 1 file changed, 484 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
-index e522379..5a17e21 100644
+index e522379..8c45775 100644
 --- a/drivers/pci/controller/pcie-apple-h9p.c
 +++ b/drivers/pci/controller/pcie-apple-h9p.c
 @@ -1,7 +1,7 @@
@@ -194,7 +194,39 @@ index e522379..5a17e21 100644
  struct apple_h9p_tunables {
  	const struct apple_h9p_tunable *regs;
  	unsigned int count;
-@@ -2014,6 +2150,284 @@ static int apple_t8010_setup_common(struct apple_h9p_pcie *pcie)
+@@ -907,6 +1043,9 @@ static void apple_h9p_pcie_detach_genpd(struct apple_h9p_pcie *pcie)
+ {
+ 	int i;
+ 
++	if (!pcie->pd_dev || !pcie->pd_link)
++		return;
++
+ 	for (i = pcie->pd_count - 1; i >= 0; i--) {
+ 		if (pcie->pd_link[i])
+ 			device_link_del(pcie->pd_link[i]);
+@@ -1691,6 +1830,7 @@ static int apple_h9p_wait_link(struct apple_h9p_pcie *pcie, unsigned int port,
+ 			       u32 *last_linksts)
+ {
+ 	ktime_t timeout = ktime_add_us(ktime_get(), 500000);
++	u32 last_ltssm = ~0U;
+ 
+ 	do {
+ 		u32 linksts = readl(pcie->base_port[port] + H9P_PORT_LINKSTS);
+@@ -1698,6 +1838,13 @@ static int apple_h9p_wait_link(struct apple_h9p_pcie *pcie, unsigned int port,
+ 
+ 		*last_linksts = linksts;
+ 
++		if (ltssm != last_ltssm) {
++			dev_info(pcie->dev,
++				 "DBG port %u: ltssm %#x linksts=%#x\n",
++				 port, ltssm, linksts);
++			last_ltssm = ltssm;
++		}
++
+ 		if (apple_h9p_ltssm_link_up(ltssm))
+ 			return 0;
+ 
+@@ -2014,6 +2161,306 @@ static int apple_t8010_setup_common(struct apple_h9p_pcie *pcie)
  	return 0;
  }
  
@@ -300,9 +332,13 @@ index e522379..5a17e21 100644
 +	h9p_rmw(rc + T8015_RC_PORT_CTL3(port), 0, T8015_RC_PORT_CTL3_ENABLE);
 +	dev_info(pcie->dev, "DBG erc %u: port enabled\n", port);
 +
++	dev_info(pcie->dev, "DBG erc %u: linksts %#x\n", port,
++		 readl(pcie->base_port[port] + H9P_PORT_LINKSTS));
 +	ret = apple_h9p_wait(pcie->base_port[port] + H9P_PORT_LINKSTS,
 +			     T8015_PORT_PIPE_CLK, T8015_PORT_PIPE_CLK,
 +			     T8015_PORT_PIPE_CLK, T8015_READY_TIMEOUT_US);
++	dev_info(pcie->dev, "DBG erc %u: pipe wait ret %d linksts %#x\n", port,
++		 ret, readl(pcie->base_port[port] + H9P_PORT_LINKSTS));
 +	if (ret)
 +		return ret;
 +	dev_info(pcie->dev, "DBG erc %u: pipe clk\n", port);
@@ -354,6 +390,7 @@ index e522379..5a17e21 100644
 +	void __iomem *config = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
 +	void __iomem *base = pcie->base_port[port];
 +	u32 speed, linksts;
++	ktime_t t0;
 +	u64 cap;
 +	int ret;
 +
@@ -377,7 +414,13 @@ index e522379..5a17e21 100644
 +	ret = apple_t8015_enable_rc_port(pcie, port);
 +	if (ret)
 +		return dev_err_probe(dev, ret, "port %u init timeout\n", port);
-+	dev_info(dev, "DBG port %u: rc enabled\n", port);
++	dev_info(dev, "DBG port %u: rc enabled linksts=%#x ctl0=%#x ctl1=%#x ctl3=%#x stat=%#x common=%#x\n",
++		 port, readl(base + H9P_PORT_LINKSTS),
++		 readl(pcie->base_rc + T8015_RC_PORT_CTL0(port)),
++		 readl(pcie->base_rc + T8015_RC_PORT_CTL1(port)),
++		 readl(pcie->base_rc + T8015_RC_PORT_CTL3(port)),
++		 readl(pcie->base_rc + T8015_RC_PORT_STAT(port)),
++		 readl(pcie->base_rc + T8015_RC_COMMON_STAT));
 +
 +	if (pcie->manual_dart[port]) {
 +		ret = apple_dart_reload_configuration(pcie->manual_dart[port],
@@ -391,8 +434,10 @@ index e522379..5a17e21 100644
 +	apple_h9p_apply_tunable_set(base, &pcie->hw->port_tunables);
 +	dev_info(dev, "DBG port %u: tunables\n", port);
 +
++	t0 = ktime_get();
 +	cap = apple_h9p_read_pci_cap(pcie, port << 3, PCI_CAP_ID_EXP);
-+	dev_info(dev, "DBG port %u: cap=%#llx\n", port, cap);
++	dev_info(dev, "DBG port %u: cap=%#llx (%lld us)\n", port, cap,
++		 ktime_to_us(ktime_sub(ktime_get(), t0)));
 +	if (!cap) {
 +		linksts = readl(base + H9P_PORT_LINKSTS);
 +		ret = -ENODEV;
@@ -423,7 +468,14 @@ index e522379..5a17e21 100644
 +			T8015_DWC_PORT3_CTL_SET, 0);
 +	}
 +
-+	dev_info(dev, "DBG port %u: lanes\n", port);
++	dev_info(dev, "DBG port %u: lanes cfg 98=%#x 164=%#x 890=%#x 8e0=%#x linkctl=%#x gen2=%#x p3ctl=%#x p3x1=%#x lnkctl2=%#x\n",
++		 port, readl(config + 0x98), readl(config + 0x164),
++		 readl(config + 0x890), readl(config + 0x8e0),
++		 readl(config + T8015_DWC_LINK_CTL),
++		 readl(config + T8015_DWC_GEN2_CTL),
++		 readl(config + T8015_DWC_PORT3_CTL),
++		 readl(config + T8015_DWC_PORT3_X1),
++		 readw(config + cap + PCI_EXP_LNKCTL2));
 +	writel(T8015_RC_PORT_LSCNT_ENABLE,
 +	       pcie->base_rc + T8015_RC_PORT_LSCNT(port));
 +	dev_info(dev, "DBG port %u: lscnt\n", port);
@@ -447,10 +499,12 @@ index e522379..5a17e21 100644
 +		return dev_err_probe(dev, ret,
 +				     "failed to deassert port %u PERST#\n",
 +				     port);
-+	dev_info(dev, "DBG port %u: perst released\n", port);
++	dev_info(dev, "DBG port %u: perst released linksts=%#x\n", port,
++		 readl(base + H9P_PORT_LINKSTS));
 +
 +	h9p_rmw(base + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
-+	dev_info(dev, "DBG port %u: ltssm on\n", port);
++	dev_info(dev, "DBG port %u: ltssm on linksts=%#x\n", port,
++		 readl(base + H9P_PORT_LINKSTS));
 +	ret = apple_h9p_wait_link(pcie, port, &linksts);
 +	dev_info(dev, "DBG port %u: wait_link %d linksts=%#x\n",
 +		 port, ret, linksts);
@@ -479,7 +533,7 @@ index e522379..5a17e21 100644
  /* Read-modify-write every entry, as iOS does, even when it already matches. */
  static void apple_t7000_write_tunables(void __iomem *base,
  				       const struct apple_h9p_tunable *tunables,
-@@ -2434,7 +2848,7 @@ static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
+@@ -2434,7 +2881,7 @@ static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
  	void __iomem *pb = pcie->base_port[port];
  	struct device *dev = pcie->dev;
  	u32 lanes = apple_s8003_lanes(pcie, port);
@@ -488,7 +542,7 @@ index e522379..5a17e21 100644
  	u32 val, lnkcap2;
  	u64 cap;
  	int ret;
-@@ -3058,6 +3472,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3058,6 +3505,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  	ret = apple_h9p_pcie_parse_ports(pcie);
  	if (ret)
  		return dev_err_probe(dev, ret, "failed to parse root ports\n");
@@ -496,7 +550,7 @@ index e522379..5a17e21 100644
  
  	if (pcie->hw->parse) {
  		ret = pcie->hw->parse(pcie);
-@@ -3068,6 +3483,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3068,6 +3516,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  	ret = apple_h9p_pcie_map_resources(pdev, pcie);
  	if (ret)
  		return ret;
@@ -504,7 +558,7 @@ index e522379..5a17e21 100644
  
  	ret = pci_pwrctrl_create_devices(dev);
  	if (ret)
-@@ -3089,10 +3505,12 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3089,10 +3538,12 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  			return dev_err_probe(dev, ret,
  					     "waiting for PCI power controls\n");
  	}
@@ -517,7 +571,7 @@ index e522379..5a17e21 100644
  
  	if (pcie->hw->has_clocks) {
  		pcie->clks[0].id = "aux";
-@@ -3103,6 +3521,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3103,6 +3554,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  			return dev_err_probe(dev, ret,
  					     "failed to get clocks\n");
  	}
@@ -525,7 +579,7 @@ index e522379..5a17e21 100644
  
  	ret = apple_h9p_pcie_attach_genpd(pcie);
  	if (ret)
-@@ -3110,6 +3529,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3110,6 +3562,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_genpd_cleanup, pcie);
  	if (ret)
  		return ret;
@@ -533,7 +587,7 @@ index e522379..5a17e21 100644
  
  	while (pcie->hw->has_clocks &&
  	       pcie->clks_enabled < ARRAY_SIZE(pcie->clks)) {
-@@ -3131,6 +3551,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3131,6 +3584,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_clk_cleanup, pcie);
  	if (ret)
  		return ret;
@@ -541,7 +595,7 @@ index e522379..5a17e21 100644
  
  	pcie->pinctrl = devm_pinctrl_get_select_default(dev);
  	if (PTR_ERR(pcie->pinctrl) == -ENODEV)
-@@ -3138,24 +3559,30 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3138,24 +3592,30 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  	else if (IS_ERR(pcie->pinctrl))
  		return dev_err_probe(dev, PTR_ERR(pcie->pinctrl),
  				     "failed to select pinctrl state\n");
@@ -572,7 +626,7 @@ index e522379..5a17e21 100644
  
  	if (!pcie->deferred_power_ports && !pcie->hw->setup_ports) {
  		ret = pci_pwrctrl_power_on_devices(dev);
-@@ -3170,12 +3597,15 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+@@ -3170,12 +3630,15 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
  	if (!of_property_read_u32(dev->of_node, "apple,msi-doorbell", &doorbell))
  		pcie->msi_doorbell = doorbell;
  
@@ -588,7 +642,7 @@ index e522379..5a17e21 100644
  
  	INIT_DELAYED_WORK(&pcie->late_work, apple_s8003_late_ports_work);
  	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_cancel_late_ports,
-@@ -3221,6 +3651,23 @@ static const struct apple_h9p_hw apple_h9p_hw_j172 = {
+@@ -3221,6 +3684,23 @@ static const struct apple_h9p_hw apple_h9p_hw_j172 = {
  	.j172_bridge_quirk = true,
  };
  
@@ -612,7 +666,7 @@ index e522379..5a17e21 100644
  static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
  	.parse = apple_s8003_parse,
  	.setup_common = apple_s8003_setup_common,
-@@ -3243,6 +3690,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
+@@ -3243,6 +3723,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
  static const struct of_device_id apple_h9p_pcie_of_match[] = {
  	{ .compatible = "apple,s8003-pcie", .data = &apple_h9p_hw_s8003 },
  	{ .compatible = "apple,j172-pcie", .data = &apple_h9p_hw_j172 },
@@ -622,4 +676,3 @@ index e522379..5a17e21 100644
  	{ }
 -- 
 2.56.0
-

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:30:00 -0600
+Subject: [PATCH] DBG: gpio: macsmc, PCI: apple-h9p: Instrument the Wi-Fi port
+ power-up
+
+TEST ONLY. The D221 Wi-Fi port (H9P port 3, BCM4357) never trains after
+its "gP0e" rail is enabled, and the log does not show what the SMC
+actually holds for that key or how the PERST# release lines up with the
+rail.
+
+Log every SMC GPIO write together with a readback of the key, made with
+the same CMD_OUTPUT read that macsmc_gpio_get uses for outputs. In the
+T8015 port setup, log the raw PERST# level after assert and after
+release, the time since the last pci-pwrctrl power-on at release and
+after the link wait, and the last LINKSTS with its LTSSM field. The
+power-on time is stamped wherever pwrctrl_powered is set.
+
+Instrumentation only: no register write, ordering or return value
+changes. It lives in the device layer, after every driver patch, so it
+applies on top of the hoolock SMC GPIO and apple-h9p T8015 patches. Not
+for submission.
+
+Signed-off-by: Eduardo Martins <372861+edulmartins@users.noreply.github.com>
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ drivers/gpio/gpio-macsmc.c              |  8 +++++++-
+ drivers/pci/controller/pcie-apple-h9p.c | 15 +++++++++++++++
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpio/gpio-macsmc.c b/drivers/gpio/gpio-macsmc.c
+index 30d799b5f..05e41e62d 100644
+--- a/drivers/gpio/gpio-macsmc.c
++++ b/drivers/gpio/gpio-macsmc.c
+@@ -187,7 +187,8 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
+ {
+ 	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+ 	smc_key key = macsmc_gpio_key(offset);
+-	int ret;
++	u32 readback = 0;
++	int ret, rb_ret;
+ 
+ 	value |= CMD_OUTPUT;
+ 	ret = apple_smc_write_u32(smcgp->smc, key, CMD_OUTPUT | value);
+@@ -195,6 +196,11 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
+ 		dev_err(smcgp->dev, "GPIO set failed %p4ch = 0x%x\n",
+ 			&key, value);
+ 
++	/* DBG: read the key back the way macsmc_gpio_get reads an output */
++	rb_ret = apple_smc_rw_u32(smcgp->smc, key, CMD_OUTPUT, &readback);
++	dev_info(smcgp->dev, "DBG set %p4ch: wrote %#x ret %d readback %#x (ret %d)\n",
++		 &key, value, ret, readback, rb_ret);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 8c457753e..7ce6294c2 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -703,6 +703,7 @@ struct apple_h9p_pcie {
+ 	u32 inherited_perst_pending;
+ 	u32 lane_cfg;
+ 	bool pwrctrl_powered;
++	ktime_t pwrctrl_on;	/* DBG: last pci_pwrctrl power-on */
+ 	/* S8003: ports waiting for their endpoint's power control */
+ 	u32 late_ports;
+ 	unsigned int late_tries;
+@@ -2074,6 +2075,7 @@ static int apple_t8010_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
+ 					     "failed to power port %u endpoint\n",
+ 					     port);
+ 		pcie->pwrctrl_powered = true;
++		pcie->pwrctrl_on = ktime_get();
+ 	}
+ 	if (port == 3) {
+ 		linksts = readl(pcie->base_port[port] + H9P_PORT_LINKSTS);
+@@ -2341,6 +2343,8 @@ static int apple_t8015_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
+ 		usleep_range(250, 1000);
+ 	}
+ 	dev_info(dev, "DBG port %u: perst asserted\n", port);
++	dev_info(dev, "DBG port %u: perst raw=%d after assert\n", port,
++		 gpiod_get_raw_value_cansleep(pcie->perst[port]));
+ 
+ 	ret = apple_t8015_enable_rc_port(pcie, port);
+ 	if (ret)
+@@ -2432,6 +2436,10 @@ static int apple_t8015_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
+ 				     port);
+ 	dev_info(dev, "DBG port %u: perst released linksts=%#x\n", port,
+ 		 readl(base + H9P_PORT_LINKSTS));
++	dev_info(dev, "DBG port %u: perst raw=%d after release, %lld ms since pwrctrl on\n",
++		 port, gpiod_get_raw_value_cansleep(pcie->perst[port]),
++		 pcie->pwrctrl_powered ?
++		 ktime_ms_delta(ktime_get(), pcie->pwrctrl_on) : -1LL);
+ 
+ 	h9p_rmw(base + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
+ 	dev_info(dev, "DBG port %u: ltssm on linksts=%#x\n", port,
+@@ -2439,6 +2447,10 @@ static int apple_t8015_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
+ 	ret = apple_h9p_wait_link(pcie, port, &linksts);
+ 	dev_info(dev, "DBG port %u: wait_link %d linksts=%#x\n",
+ 		 port, ret, linksts);
++	dev_info(dev, "DBG port %u: last linksts=%#x ltssm=%#lx, %lld ms since pwrctrl on\n",
++		 port, linksts, FIELD_GET(H9P_PORT_LINKSTS_LTSSM, linksts),
++		 pcie->pwrctrl_powered ?
++		 ktime_ms_delta(ktime_get(), pcie->pwrctrl_on) : -1LL);
+ 	if (ret) {
+ 		dev_warn(dev,
+ 			 "port %u link did not reach L0 (linksts=%#x)\n",
+@@ -3044,6 +3056,7 @@ static int apple_s8003_setup_endpoint_port(struct apple_h9p_pcie *pcie,
+ 		if (ret)
+ 			return ret;
+ 		pcie->pwrctrl_powered = true;
++		pcie->pwrctrl_on = ktime_get();
+ 		msleep(S8003_ENDPOINT_SETTLE_MS);
+ 
+ 		ret = apple_s8003_setup_port_tries(pcie, port);
+@@ -3219,6 +3232,7 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
+ 					     "failed to repower port %u endpoint\n",
+ 					     port);
+ 		pcie->pwrctrl_powered = true;
++		pcie->pwrctrl_on = ktime_get();
+ 
+ 		ret = pcie->hw->setup_port(pcie, port, &result);
+ 		if (ret)
+@@ -3624,6 +3638,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 					     "failed to power on PCI devices\n");
+ 		}
+ 		pcie->pwrctrl_powered = true;
++		pcie->pwrctrl_on = ktime_get();
+ 	}
+ 
+ 	pcie->msi_doorbell = H9P_DEFAULT_MSI_DOORBELL;
+-- 
+2.56.0
+

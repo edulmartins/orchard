@@ -31,7 +31,8 @@ def check_busybox(path):
 
 def assemble_ram(hardware, output, *, kernel, busybox, loader, pongo, init,
                  files=None, hostname='orchard-ram', platform, boards, modules=False,
-                 bootargs='console=tty0 loglevel=7 rdinit=/init', sources=()):
+                 bootargs='console=tty0 loglevel=7 rdinit=/init '
+                          'trace_event=gpio:*,regulator:* tp_printk panic=0', sources=()):
     """Pack a caller-owned /init and arbitrary files for every board of PLATFORM.
 
     BOARDS maps each board to its DTB name; m1n1 picks the booted board's DTB.

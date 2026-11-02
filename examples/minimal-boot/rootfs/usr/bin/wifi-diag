@@ -1,0 +1,99 @@
+#!/bin/sh
+# wifi-diag: read-only snapshot of the D221 Wi-Fi (H9P PCIe port 3, BCM4357)
+# bring-up state. Run once at the serial shell; writes /tmp/wifi-diag.txt and
+# prints it. Never writes a register: devmem is used for 32-bit reads only.
+# BusyBox sh; no set -e, so a failing read never aborts the report.
+
+out=/tmp/wifi-diag.txt
+dbg=/sys/kernel/debug
+
+section() { printf '\n### %s\n' "$*"; }
+try() { "$@" 2>&1 || echo "(failed, rc=$?: $*)"; }
+show() { if [ -e "$1" ]; then try cat "$1"; else echo "(missing: $1)"; fi; }
+mounted() { grep -q " $1 " /proc/mounts; }
+
+mounted "$dbg" || mount -t debugfs -o nosuid,nodev,noexec debugfs "$dbg" 2>/dev/null
+[ -d /sys/kernel/tracing ] && ! mounted /sys/kernel/tracing &&
+	mount -t tracefs -o nosuid,nodev,noexec tracefs /sys/kernel/tracing 2>/dev/null
+
+report() {
+	section "wifi-diag $(date 2>/dev/null) $(uname -r 2>/dev/null)"
+	echo "cmdline: $(cat /proc/cmdline 2>/dev/null)"
+	echo "mounts: $(grep -E 'debugfs|tracefs' /proc/mounts | tr '\n' ' ')"
+
+	section "dmesg (filtered)"
+	try dmesg | grep -iE 'h9p|DBG|pwrctrl|wlan|regulator|smc|pcie|defer|direction_output|active low'
+
+	section "devices_deferred"
+	show "$dbg/devices_deferred"
+
+	section "regulator_summary"
+	show "$dbg/regulator/regulator_summary"
+
+	section "gpio"
+	show "$dbg/gpio"
+
+	section "pm_genpd_summary"
+	show "$dbg/pm_genpd/pm_genpd_summary"
+
+	section "pinmux-pins 40/163/167"
+	found=
+	for f in "$dbg"/pinctrl/*/pinmux-pins; do
+		[ -e "$f" ] || continue
+		found=1
+		echo "$f:"
+		grep -E '^pin (40|163|167) ' "$f" 2>&1
+	done
+	[ -n "$found" ] || echo "(no pinctrl/*/pinmux-pins under $dbg)"
+
+	section "PCI devices"
+	found=
+	for d in /sys/bus/pci/devices/*; do
+		[ -e "$d" ] || continue
+		found=1
+		printf '%s:' "${d##*/}"
+		for a in vendor device current_link_speed current_link_width; do
+			printf ' %s=%s' "$a" "$(cat "$d/$a" 2>/dev/null || echo '?')"
+		done
+		echo
+	done
+	[ -n "$found" ] || echo "(no PCI devices enumerated)"
+
+	section "AP pinctrl raw (base 0x233100000, 4 bytes per pin; read-only)"
+	# Bits (pinctrl-apple-gpio.c): 0 DATA, 3:1 MODE (0 off/input, 1 OUT,
+	# 2..6 input IRQ hi/lo/up/dn/any, 7 input no IRQ), 4 S8000_MUX,
+	# 6:5 PERIPH (function), 8:7 PULL (0 off, 1 down, 2 up-strong, 3 up),
+	# 9 INPUT_ENABLE, 15 SCHMITT, 18:16 IRQ GRP, 21 LOCK.
+	for p in 40:0x2331000a0 163:0x23310028c 167:0x23310029c; do
+		pin=${p%%:*} addr=${p#*:}
+		v=$(devmem "$addr" 32 2>&1) || { echo "pin $pin @ $addr: devmem failed: $v"; continue; }
+		case $v in 0x*|0X*) ;; *) echo "pin $pin @ $addr: unexpected '$v'"; continue;; esac
+		n=$((v))
+		printf 'pin %s @ %s = %s  data=%d mode=%d periph=%d pull=%d ie=%d\n' \
+			"$pin" "$addr" "$v" $((n & 1)) $(((n >> 1) & 7)) \
+			$(((n >> 5) & 3)) $(((n >> 7) & 3)) $(((n >> 9) & 1))
+	done
+
+	section "port 3 LINKSTS (0x604000208)"
+	# Reading a gated PCIe block hangs the SoC, so only read with the
+	# "pcie" genpd (the host bridge's power domain) reported on. The pattern
+	# is anchored at column 0: "pcie" also appears indented as a child of
+	# pcie_direct. The pcie_ref clock gate is not checked here.
+	if grep -qE '^pcie[[:space:]]+on' "$dbg/pm_genpd/pm_genpd_summary" 2>/dev/null; then
+		v=$(devmem 0x604000208 32 2>&1)
+		case $v in
+		0x*|0X*) n=$((v))
+			printf 'LINKSTS = %s  ltssm=0x%x link_present=%d\n' "$v" \
+				$(((n >> 8) & 0x3f)) $(((n >> 3) & 1));;
+		*) echo "devmem failed: $v";;
+		esac
+	else
+		echo "SKIPPED: domain gated (genpd 'pcie' not on, or pm_genpd_summary missing)"
+	fi
+
+	section "dmesg (full)"
+	try dmesg
+}
+
+report 2>&1 | tee "$out"
+echo "wifi-diag: report saved to $out"
