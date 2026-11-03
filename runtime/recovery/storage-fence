@@ -14,6 +14,9 @@ failed() {
 trap failed EXIT
 [ "$(grep -c '/dev/nvme' /proc/mounts || true)" = 0 ]
 modprobe nvme
+# The A11 (T8015) has no PCIe storage port: its NAND is the ANS2 controller
+# (nvme-apple). Other platforms leave it unbound or lack the module.
+modprobe -q nvme-apple 2>/dev/null || true
 step=wait
 n=0
 while [ "$(cat /sys/class/nvme/nvme0/state 2>/dev/null)" != live ]; do n=$((n+1)); [ "$n" -le 30 ]; sleep 1; done
