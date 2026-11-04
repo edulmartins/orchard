@@ -86,6 +86,35 @@ class PlatformLayer(unittest.TestCase):
                          b'kernel/drivers/nvme/host/nvme-core.ko:\n'
                          b'kernel/drivers/nvme/host/nvme.ko: kernel/drivers/nvme/host/nvme-core.ko\n')
 
+    def test_the_initrd_also_loads_nvme_apple_when_present(self):
+        import gzip, io
+        from orchard.image.runtime import module_files
+        module_root = self.bundle / 'lib/modules' / RELEASE
+        (module_root / 'kernel/drivers/nvme/host/nvme-apple.ko').write_bytes(b'nvme-apple')
+        (module_root / 'modules.dep').write_text(
+            'kernel/drivers/x.ko:\n'
+            'kernel/drivers/nvme/host/nvme-core.ko:\n'
+            'kernel/drivers/nvme/host/nvme.ko: kernel/drivers/nvme/host/nvme-core.ko\n'
+            'kernel/drivers/nvme/host/nvme-apple.ko: kernel/drivers/nvme/host/nvme-core.ko\n')
+        release, files = module_files(self.bundle / 'lib/modules')
+        names = {}
+        stream = io.BytesIO(gzip.decompress(platform.initrd(files, release, self.busybox)))
+        while True:
+            header = stream.read(110)
+            fields = [int(header[i:i + 8], 16) for i in range(6, 110, 8)]
+            name = stream.read(fields[11])[:-1].decode()
+            stream.read(-(110 + fields[11]) % 4)
+            if name == 'TRAILER!!!':
+                break
+            names[name] = stream.read(fields[6])
+            stream.read(-fields[6] % 4)
+        base = f'lib/modules/{RELEASE}/'
+        self.assertEqual(names['etc/orchard/modules'], b'nvme\nnvme-apple\n')
+        self.assertEqual(sorted(name for name in names if name.endswith('.ko')),
+                         [base + 'kernel/drivers/nvme/host/nvme-apple.ko',
+                          base + 'kernel/drivers/nvme/host/nvme-core.ko',
+                          base + 'kernel/drivers/nvme/host/nvme.ko'])
+
     def test_the_same_inputs_give_the_same_archive(self):
         first, second = self.work / 'a', self.work / 'b'
         first.mkdir(), second.mkdir()
