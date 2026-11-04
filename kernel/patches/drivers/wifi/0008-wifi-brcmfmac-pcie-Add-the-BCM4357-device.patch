@@ -10,16 +10,31 @@ The iPhone X (d221) radio enumerates as 14e4:440a, the Apple BCM4357.
 brcmfmac does not know the device ID, so no driver binds even though the
 firmware and NVRAM are already installed under
 brcmfmac4357-pcie.apple,herculesk.*. It is a mobility chip like the
-neighbouring 4356/4358/4359, so it uses the WCC firmware framework.
+neighbouring 4356/4358/4359, so it uses the WCC firmware framework, and
+its TCM RAM is at 0x180000 like the other 435x chips.
 
-Add the 4357 chip and device IDs and wire its firmware name as WCC.
+Add the 4357 chip and device IDs, wire its firmware name as WCC, and give
+it the 0x180000 TCM RAM base the CR4 core needs.
 
 Assisted-by: LLM
 ---
- drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c        | 3 +++
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c         | 1 +
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c         | 3 +++
  drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h   | 2 ++
- 2 files changed, 5 insertions(+)
+ 3 files changed, 6 insertions(+)
 
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
+index 4adc0d0e4..7a6fd620f 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
+@@ -718,6 +718,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
+ 	case BRCM_CC_4350_CHIP_ID:
+ 	case BRCM_CC_4354_CHIP_ID:
+ 	case BRCM_CC_4356_CHIP_ID:
++	case BRCM_CC_4357_CHIP_ID:
+ 	case BRCM_CC_43567_CHIP_ID:
+ 	case BRCM_CC_43569_CHIP_ID:
+ 	case BRCM_CC_43570_CHIP_ID:
 diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
 index 55f4d7b97..9492bc519 100644
 --- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
