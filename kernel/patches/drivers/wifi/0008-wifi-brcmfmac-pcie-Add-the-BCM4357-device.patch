@@ -13,15 +13,19 @@ brcmfmac4357-pcie.apple,herculesk.*. It is a mobility chip like the
 neighbouring 4356/4358/4359, so it uses the WCC firmware framework, and
 its TCM RAM is at 0x180000 like the other 435x chips.
 
-Add the 4357 chip and device IDs, wire its firmware name as WCC, and give
-it the 0x180000 TCM RAM base the CR4 core needs.
+Its OTP also lives in ChipCommon starting at 0x8c0, so read it like the
+BCM4350's: that is what lets the driver pick the board- and module-
+specific images (apple,herculesk-GINS-m-5.3) instead of a bare name.
+
+Add the 4357 chip and device IDs, wire its firmware name as WCC, give it
+the TCM RAM base the CR4 core needs, and read its OTP.
 
 Assisted-by: LLM
 ---
- drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c         | 1 +
- drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c         | 3 +++
- drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h   | 2 ++
- 3 files changed, 6 insertions(+)
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c       |  1 +
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c       | 13 ++++++++++++-
+ drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h |  2 ++
+ 3 files changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
 index 4adc0d0e4..7a6fd620f 100644
@@ -36,7 +40,7 @@ index 4adc0d0e4..7a6fd620f 100644
  	case BRCM_CC_43569_CHIP_ID:
  	case BRCM_CC_43570_CHIP_ID:
 diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
-index 55f4d7b97..9492bc519 100644
+index 55f4d7b97..96c4f2b31 100644
 --- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
 +++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
 @@ -55,6 +55,7 @@ BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
@@ -55,7 +59,24 @@ index 55f4d7b97..9492bc519 100644
  	BRCMF_FW_ENTRY(BRCM_CC_43567_CHIP_ID, 0xFFFFFFFF, 43570),
  	BRCMF_FW_ENTRY(BRCM_CC_43569_CHIP_ID, 0xFFFFFFFF, 43570),
  	BRCMF_FW_ENTRY(BRCM_CC_43570_CHIP_ID, 0xFFFFFFFF, 43570),
-@@ -2738,6 +2759,7 @@ static const struct pci_device_id brcmf_pcie_devid_table[] = {
+@@ -2066,6 +2068,16 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
+ 		words = (otpsize + 1) * 1024 / 16 - (0x8c0 - 0x800) / 2;
+ 		optional = true;
+ 		break;
++	case BRCM_CC_4357_CHIP_ID:
++		otpsize = (devinfo->ci->cc_caps & CC_CAP_OTPSIZE) >>
++			  CC_CAP_OTPSIZE_SHIFT;
++		if (!otpsize)
++			return 0;
++		coreid = BCMA_CORE_CHIPCOMMON;
++		base = 0x8c0;
++		words = (otpsize + 1) * 1024 / 16 - (0x8c0 - 0x800) / 2;
++		optional = true;
++		break;
+ 	case BRCM_CC_4355_CHIP_ID:
+ 		coreid = BCMA_CORE_CHIPCOMMON;
+ 		base = 0x8c0;
+@@ -2738,6 +2750,7 @@ static const struct pci_device_id brcmf_pcie_devid_table[] = {
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_4354_RAW_DEVICE_ID, WCC),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_4355_DEVICE_ID, WCC_SEED),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_4356_DEVICE_ID, WCC),

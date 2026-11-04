@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <eduardo@martins.ws>
+Date: Wed, 4 Nov 2026 00:20:00 -0600
+Subject: [PATCH] arm64: dts: apple: t8015-d221: Set the Wi-Fi board type
+
+brcmfmac names Apple firmware after the board type the device tree
+carries ("apple,<board>"); without it the driver only requests the bare
+brcmfmac4357-pcie.bin, which does not exist, and the dongle setup fails
+with -ENOENT.
+
+The D221's BCM4357 ships the "herculesk" images, the same name the
+device's firmware recipe in Orchard uses.
+
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8015-d221.dts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015-d221.dts b/arch/arm64/boot/dts/apple/t8015-d221.dts
+index c2c8486..9a1f3d2 100644
+--- a/arch/arm64/boot/dts/apple/t8015-d221.dts
++++ b/arch/arm64/boot/dts/apple/t8015-d221.dts
+@@ -38,3 +38,7 @@ &port03 {
+ 		vdd-supply = <&wlan_vdd>;
+ 	};
+ };
++
++&wifi0 {
++	brcm,board-type = "apple,herculesk";
++};
+-- 
+2.35.1
