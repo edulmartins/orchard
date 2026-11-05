@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <eduardo@martins.ws>
+Date: Thu, 5 Nov 2026 15:58:16 -0600
+Subject: [PATCH] arm64: dts: apple: t8015: Drop the S5L8960X fallback of the
+ PCIe DARTs
+
+They are driven as T8015 DARTs now.
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/apple/t8015.dtsi | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015.dtsi b/arch/arm64/boot/dts/apple/t8015.dtsi
+index 58850628a..85c1ba5f3 100644
+--- a/arch/arm64/boot/dts/apple/t8015.dtsi
++++ b/arch/arm64/boot/dts/apple/t8015.dtsi
+@@ -710,7 +710,7 @@ sart: iommu@259c50000 {
+ 		};
+ 
+ 		dart_apcie2: iommu@603008000 {
+-			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
++			compatible = "apple,t8015-dart";
+ 			reg = <0x6 0x03008000 0x0 0x4000>;
+ 			#iommu-cells = <5>;
+ 			interrupt-parent = <&aic>;
+@@ -724,7 +724,7 @@ dart_apcie2: iommu@603008000 {
+ 		};
+ 
+ 		dart_apcie3: iommu@604008000 {
+-			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
++			compatible = "apple,t8015-dart";
+ 			reg = <0x6 0x04008000 0x0 0x4000>;
+ 			#iommu-cells = <5>;
+ 			interrupt-parent = <&aic>;
