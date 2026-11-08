@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <eduardo@martins.ws>
+Date: Thu, 5 Nov 2026 15:58:15 -0600
+Subject: [PATCH] dt-bindings: iommu: apple,dart: T8015 is not
+ S5L8960X-compatible
+
+The A11 DART has the T8020's register layout for its stream tables and
+its own stream command; programmed as an S5L8960X it fails its readback
+checks. iOS drives it with a driver of its own (ADT "dart,t8015").
+
+Assisted-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Documentation/devicetree/bindings/iommu/apple,dart.yaml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/iommu/apple,dart.yaml b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+index df72722fc..1929ba892 100644
+--- a/Documentation/devicetree/bindings/iommu/apple,dart.yaml
++++ b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+@@ -25,6 +25,7 @@ properties:
+     oneOf:
+       - enum:
+           - apple,s5l8960x-dart
++          - apple,t8015-dart
+           - apple,t8103-dart
+           - apple,t8103-usb4-dart
+           - apple,t8110-dart
+@@ -37,7 +38,6 @@ properties:
+               - apple,t7000-dart
+               - apple,s8000-dart
+               - apple,t8010-dart
+-              - apple,t8015-dart
+           - const: apple,s5l8960x-dart
+ 
+   reg:
