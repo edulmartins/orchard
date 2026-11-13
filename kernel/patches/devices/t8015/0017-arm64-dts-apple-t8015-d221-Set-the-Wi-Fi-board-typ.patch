@@ -17,11 +17,12 @@ Assisted-by: LLM
  1 file changed, 4 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/apple/t8015-d221.dts b/arch/arm64/boot/dts/apple/t8015-d221.dts
-index c2c8486fd..7a93cbfc8 100644
+index 4abebf4ff..7a93cbfc8 100644
 --- a/arch/arm64/boot/dts/apple/t8015-d221.dts
 +++ b/arch/arm64/boot/dts/apple/t8015-d221.dts
-@@ -38,3 +38,7 @@ wifi0: wifi@0,0 {
+@@ -38,4 +38,8 @@ wifi0: wifi@0,0 {
  		vdd-supply = <&wlan_vdd>;
+ 		brcm,ccode-map-trivial;
  	};
  };
 +
