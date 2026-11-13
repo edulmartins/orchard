@@ -10,15 +10,21 @@ The iPhone X (d221) radio enumerates as 14e4:440a, the Apple BCM4357.
 brcmfmac does not know the device ID, so no driver binds even though the
 firmware and NVRAM are already installed under
 brcmfmac4357-pcie.apple,herculesk.*. It is a mobility chip like the
-neighbouring 4356/4358/4359, so it uses the WCC firmware framework, and
-its TCM RAM is at 0x180000 like the other 435x chips.
+neighbouring 4356/4358/4359, so it uses the WCC firmware framework.
+Its TCM RAM is at 0x170000, not the 0x180000 of the 435x chips: the
+d221 firmware (4357b1, 13.10.688.4) is linked there, and 652 of its 697
+string pointers resolve only with that base. Loading it 64 KiB too high
+puts the NVRAM past the end of RAM.
+
+It is an Apple "olympic" firmware with bcm_rng, like the 4355, 4364 and
+4377 ones, so it gets the random seed before the NVRAM too (WCC_SEED).
 
 Its OTP also lives in ChipCommon starting at 0x8c0, so read it like the
 BCM4350's: that is what lets the driver pick the board- and module-
 specific images (apple,herculesk-GINS-m-5.3) instead of a bare name.
 
-Add the 4357 chip and device IDs, wire its firmware name as WCC, give it
-the TCM RAM base the CR4 core needs, and read its OTP.
+Add the 4357 chip and device IDs, wire its firmware name as WCC with the
+seed, give it the TCM RAM base its firmware is linked at, and read its OTP.
 
 Assisted-by: LLM
 ---
@@ -31,14 +37,14 @@ diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c b/drivers/n
 index 4adc0d0e4..7a6fd620f 100644
 --- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
 +++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
-@@ -718,6 +718,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
- 	case BRCM_CC_4350_CHIP_ID:
- 	case BRCM_CC_4354_CHIP_ID:
- 	case BRCM_CC_4356_CHIP_ID:
+@@ -741,6 +741,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
+ 	case BRCM_CC_43751_CHIP_ID:
+ 	case BRCM_CC_43752_CHIP_ID:
+ 	case BRCM_CC_4377_CHIP_ID:
 +	case BRCM_CC_4357_CHIP_ID:
- 	case BRCM_CC_43567_CHIP_ID:
- 	case BRCM_CC_43569_CHIP_ID:
- 	case BRCM_CC_43570_CHIP_ID:
+ 		return 0x170000;
+ 	case BRCM_CC_4378_CHIP_ID:
+ 		return 0x352000;
 diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
 index 55f4d7b97..96c4f2b31 100644
 --- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
@@ -80,7 +86,7 @@ index 55f4d7b97..96c4f2b31 100644
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_4354_RAW_DEVICE_ID, WCC),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_4355_DEVICE_ID, WCC_SEED),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_4356_DEVICE_ID, WCC),
-+	BRCMF_PCIE_DEVICE(BRCM_PCIE_4357_DEVICE_ID, WCC),
++	BRCMF_PCIE_DEVICE(BRCM_PCIE_4357_DEVICE_ID, WCC_SEED),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_43567_DEVICE_ID, WCC),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_43570_DEVICE_ID, WCC),
  	BRCMF_PCIE_DEVICE(BRCM_PCIE_43570_RAW_DEVICE_ID, WCC),
