@@ -81,16 +81,39 @@ On one `d221` (kernel `7.3.0-rc1-orchard-apple-16k`), port 3 trains to L0
 `106b:100a`. `link_present` reads 0 throughout; `BIT(3)` of LINKSTS is a
 T8015 card-detect semantic, not a failure. The SMC `gP0e` rail is active-high.
 
+## Wi-Fi on hardware (2026-11-15)
+
+Branch `d221-wifi-0.3` adds the T8015 DART, the BCM4357 (`14e4:440a`) entry in
+brcmfmac and the chip's RAM base. One `d221`, RAM boot of the `d221-check`
+payload (kernel `7.3.0-rc1-orchard-apple-16k` with `CONFIG_BRCMDBG`), three
+loads of brcmfmac with `debug=0x180004`:
+
+- The phone stays up. With the RAM base at `0x180000` (2026-11-08) it crashed
+  right after `brcmf_fw_alloc_request` every time. The `4357b1` firmware
+  (13.10.688.4) is linked at `0x170000`: 652 of its 697 text pointers match only
+  that base. `brcmf_chip_get_raminfo` reports `base=0x170000 size=0x150000`.
+- The DART now translates: the endpoint joins iommu group 0 (type `DMA`), and
+  the DART error register stays 0 through the load.
+- The firmware does not come up: `FW failed to initialize` 5 s after
+  `Bring ARM in running state`, then `Dongle setup failed` and
+  `brcmf_fw_crashed`. No `wlan` interface appears.
+- No NVRAM is found by default: brcmfmac asks for `brcmfmac4357-pcie.txt`, and
+  the layer only has `brcmfmac4357-pcie.apple,herculesk-GINS-{m-5.3,u-6.1}.txt`.
+  The Apple OTP-based name selection does not run. With the `GINS-m-5.3`
+  profile copied to the generic name (RAM only), NVRAM and the random seed
+  are written and the result is the same.
+- The memory dump (`brcmf_pcie_get_memdump`, 1376256 bytes from `0x170000`)
+  holds the firmware image unchanged except for 80 bytes from offset
+  `0xa2112`, so the ARM core ran briefly. The firmware console is empty, and
+  the last word of RAM (the shared-area address the host waits for) stays 0.
+- `irq: no irq domain found for pci@3,0` at brcmfmac registration: the port's
+  INTx/MSI routing is still missing.
+
 ## What remains for a working Wi-Fi port
 
-1. Host wake: the endpoint's host-wake interrupt, alongside the
-   `device-wake` line in the table above.
-2. brcmfmac has no BCM4357 (`14e4:440a`) entry, so the Wi-Fi driver side is
-   still missing; that is a linux-wireless topic and does not block the PCIe
-   series.
-3. DMA translation for the Wi-Fi port: at probe, `apple-dart 604008000.iommu`
-   reports `translation setup for streams 1 failed: -5` and `blocking DMA for
-   streams 1`, with an `iommu_setup_default_domain` warning from
-   `apple_h9p_pcie_probe`. Enumeration is not affected, but the endpoint has
-   no working DMA mapping, so this has to be fixed before brcmfmac can run
-   (seen on a d221 with the series at a538a0f).
+1. Find where the firmware stops: the 80 changed bytes and the CR4 trap
+   state in the memory dump.
+2. NVRAM selection: read the OTP (`brcmf_pcie_read_otp`, as on Apple Silicon)
+   or name the module in the device tree, then try both GINS profiles.
+3. The port's interrupt: an irq domain (MSI or INTx) for `pci@3,0`.
+4. Host wake is not needed: brcmfmac uses it only on SDIO.
