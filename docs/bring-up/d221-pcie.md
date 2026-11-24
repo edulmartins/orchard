@@ -102,18 +102,76 @@ loads of brcmfmac with `debug=0x180004`:
   The Apple OTP-based name selection does not run. With the `GINS-m-5.3`
   profile copied to the generic name (RAM only), NVRAM and the random seed
   are written and the result is the same.
-- The memory dump (`brcmf_pcie_get_memdump`, 1376256 bytes from `0x170000`)
-  holds the firmware image unchanged except for 80 bytes from offset
-  `0xa2112`, so the ARM core ran briefly. The firmware console is empty, and
-  the last word of RAM (the shared-area address the host waits for) stays 0.
-- `irq: no irq domain found for pci@3,0` at brcmfmac registration: the port's
-  INTx/MSI routing is still missing.
+- The one memory dump kept (`brcmf_pcie_get_memdump`, 1376256 bytes from
+  `0x170000`) is from the load without NVRAM: the end of RAM holds neither
+  NVRAM text nor the random seed's `0xfeedc0de` footer. It holds the firmware
+  image unchanged except for 80 bytes from offset `0xa2111`: the RAM range the
+  firmware found (`0x170000`-`0x2c0000`), stack pointers near `0x2bdff0`, heap
+  pointers and 32 bytes of entropy. So the ARM core ran its early init (heap,
+  then the DRBG behind `bcm_rng`) and stopped there; the globals its init sets
+  next (at `0x170e04`, `0x170e08`) are still 0. The firmware console is empty,
+  and the last word of RAM (the shared-area address the host waits for) stays 0.
+  The load with NVRAM left no dump.
+- `irq: no irq domain found for pci@3,0` at brcmfmac registration: the PCI
+  core looks for an INTx route, and apple-h9p has only MSI.
+
+## Hypotheses and changes (2026-11-23)
+
+Branch `d221-wifi-0.3.6` rebases the series on Orchard 0.3.6 and adds the
+following. Built as kernel `7.3.0-rc1-orchard-apple-16k-wifi812`, not yet run.
+
+1. **The module's UART (most likely cause of the stall).** The ADT has two
+   `wlan` nodes: the PCIe endpoint below `apcie/pci-bridge3`, and the
+   platform-control function `wlan-pcie-uart,bcm4357` (`module-instance
+   herculesk`, `function-reg_on`, the host-wake GPIO, `wifi-calibration-msf`,
+   `local-mac-address`) below **uart4** (`0x22e610000`, `function-tx` AP GPIO
+   215, `function-rts` AP GPIO 217). Every board whose PCIe Wi-Fi comes up in
+   this repository (A9 iPad 5, A10 iPad 6 and 7) holds that UART through the
+   `apple,t8010-wlan-uart-provider` platform control, which muxes TX and RTS,
+   keeps the UART's power domain on and resets the block before pci-pwrctrl
+   powers the endpoint. The D221 had none of it. If the module waits on those
+   lines (flow control of its own UART, or a strap), it stops in early init,
+   as the dump shows, with or without NVRAM. Patch
+   `devices/t8015/0022`: the provider node for uart4 in `t8015.dtsi`
+   (disabled), enabled on the D221 with its pins and linked from `wifi0`.
+2. **NVRAM by OTP.** The board type (`apple,herculesk`) is set, but the 0.3
+   series read the OTP size from ChipCommon, which is 0 on this chip, so no
+   OTP was read (no `OTP data` lines in the log) and only the bare names were
+   tried. The BCM4357 has an always-on backplane (separate GCI `0x840` and PMU
+   `0x827` cores), like the BCM4377 family, whose OTP is shadowed in the GCI
+   core. `drivers/wifi/0018` now reads the first KiB of the GCI shadow
+   (`0x1000`) and looks for Apple's system-vendor tuple (`0x15`, header
+   `0x8`); brcmfmac then asks for `apple,herculesk-GINS-<vendor>-<version>`
+   before the bare board type. Without a record nothing changes.
+3. **The port's interrupt is not missing.** apple-h9p gives each port 8 MSI
+   vectors from the controller's block at SPI 352; port 3's base is 24, as the
+   ADT's `msi-vector-base`. brcmfmac enables MSI before it requests its
+   interrupt, after the firmware is up. The `no irq domain` line is the PCI
+   core's INTx lookup through the root port node, which has no
+   `interrupt-map`; it is harmless while MSI works. Check `/proc/interrupts`
+   for `brcmf_pcie_intr` once the firmware comes up.
+4. **Device wake.** The D221 uses the J172 power data: REG_ON, then 100 ms,
+   with `device-wake` held low. The iPhone 7 (D11, D111) pulses it and leaves
+   it high. Not changed here; next to try if 1 does not help.
+5. **The 32 kHz sleep clock.** `brcmf_of_probe` reports no LPO clock. If iBoot
+   leaves the PMIC's 32 kHz output off, the chip's PMU would wait for its ILP
+   clock. Not changed here.
+
+## Next test
+
+On the installed system, with the `wifi812` kernel booted:
+
+1. `dmesg | grep -i -e wlan -e brcmf -e pwrctrl`: the provider binds
+   (`apple-wlan-provider 22e610000.wlan-platform-control`) before the Wi-Fi
+   endpoint powers up.
+2. Reload brcmfmac with `debug=0x180004` and keep every
+   `/sys/class/devcoredump/devcd*/data`: the `OTP data` words, the
+   `Apple OTP record at` line and the NVRAM name it asks for.
+3. If `FW failed to initialize` remains, the dump of the load with NVRAM is
+   the one to read.
 
 ## What remains for a working Wi-Fi port
 
-1. Find where the firmware stops: the 80 changed bytes and the CR4 trap
-   state in the memory dump.
-2. NVRAM selection: read the OTP (`brcmf_pcie_read_otp`, as on Apple Silicon)
-   or name the module in the device tree, then try both GINS profiles.
-3. The port's interrupt: an irq domain (MSI or INTx) for `pci@3,0`.
-4. Host wake is not needed: brcmfmac uses it only on SDIO.
+1. Run the `wifi812` kernel (above).
+2. If the firmware still stops: device wake (4), then the LPO clock (5).
+3. Host wake is not needed: brcmfmac uses it only on SDIO.

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Eduardo Martins <eduardo@martins.ws>
-Date: Wed, 4 Nov 2026 00:20:00 -0600
+Date: Mon, 23 Nov 2026 22:19:24 -0600
 Subject: [PATCH] arm64: dts: apple: t8015-d221: Set the Wi-Fi board type
 
 brcmfmac names Apple firmware after the board type the device tree
@@ -8,26 +8,22 @@ carries ("apple,<board>"); without it the driver only requests the bare
 brcmfmac4357-pcie.bin, which does not exist, and the dongle setup fails
 with -ENOENT.
 
-The D221's BCM4357 ships the "herculesk" images, the same name the
-device's firmware recipe in Orchard uses.
+The D221's BCM4357 ships the "herculesk" images: the module-instance of
+the ADT's wlan node, and the name the device's firmware recipe in
+Orchard uses.
 
 Assisted-by: LLM
 ---
- arch/arm64/boot/dts/apple/t8015-d221.dts | 4 ++++
- 1 file changed, 4 insertions(+)
+ arch/arm64/boot/dts/apple/t8015-d221.dts | 1 +
+ 1 file changed, 1 insertion(+)
 
 diff --git a/arch/arm64/boot/dts/apple/t8015-d221.dts b/arch/arm64/boot/dts/apple/t8015-d221.dts
-index 4abebf4ff..7a93cbfc8 100644
+index 210790edd..a799db51d 100644
 --- a/arch/arm64/boot/dts/apple/t8015-d221.dts
 +++ b/arch/arm64/boot/dts/apple/t8015-d221.dts
-@@ -38,4 +38,8 @@ wifi0: wifi@0,0 {
- 		vdd-supply = <&wlan_vdd>;
- 		brcm,ccode-map-trivial;
- 	};
- };
-+
-+&wifi0 {
+@@ -16,4 +16,5 @@ / {
+ /* The D221 keeps its own name for the module ahead of the PCI ID. */
+ &wifi0 {
+ 	compatible = "apple,d221-bcm4357-wifi", "pci14e4,440a";
 +	brcm,board-type = "apple,herculesk";
-+};
--- 
-2.35.1
+ };

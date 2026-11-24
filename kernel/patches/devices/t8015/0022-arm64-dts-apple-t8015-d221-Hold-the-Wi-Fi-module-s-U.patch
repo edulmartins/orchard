@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eduardo Martins <eduardo@martins.ws>
+Date: Mon, 23 Nov 2026 22:20:07 -0600
+Subject: [PATCH] arm64: dts: apple: t8015-d221: Hold the Wi-Fi module's UART
+
+On the iPhone X the ADT's "wlan" node, the platform-control function of
+the BCM4357 (compatible wlan-pcie-uart,bcm4357, module-instance
+herculesk), sits below uart4, with function-tx on AP GPIO 215 and
+function-rts on AP GPIO 217. The iPads whose PCIe Wi-Fi comes up (A9
+iPad 5, A10 iPad 6 and 7) hold the same UART of theirs through the
+apple,t8010-wlan-uart-provider platform control: it muxes those two
+pins, keeps the UART's power domain on and resets the block before
+pci-pwrctrl powers the endpoint. The D221 had none of it, and its
+firmware stops early in its init without writing the shared area
+(FW failed to initialize).
+
+Describe uart4's platform control in the SoC file, disabled, and enable
+it on the D221 with its pins, linked from the Wi-Fi endpoint.
+
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8015-d221.dts | 15 +++++++++++++++
+ arch/arm64/boot/dts/apple/t8015.dtsi     | 11 +++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8015-d221.dts b/arch/arm64/boot/dts/apple/t8015-d221.dts
+index a799db51d..d005a1c7d 100644
+--- a/arch/arm64/boot/dts/apple/t8015-d221.dts
++++ b/arch/arm64/boot/dts/apple/t8015-d221.dts
+@@ -17,4 +17,19 @@ / {
+ &wifi0 {
+ 	compatible = "apple,d221-bcm4357-wifi", "pci14e4,440a";
+ 	brcm,board-type = "apple,herculesk";
++	apple,wlan-uart = <&wlan_uart4>;
++};
++
++&pinctrl_ap {
++	/* ADT uart4 function-tx and function-rts */
++	wlan_uart4_pins: wlan-uart4-pins {
++		pinmux = <APPLE_PINMUX(215, 1)>,
++			 <APPLE_PINMUX(217, 1)>;
++	};
++};
++
++&wlan_uart4 {
++	pinctrl-0 = <&wlan_uart4_pins>;
++	pinctrl-names = "default";
++	status = "okay";
+ };
+diff --git a/arch/arm64/boot/dts/apple/t8015.dtsi b/arch/arm64/boot/dts/apple/t8015.dtsi
+index 85c1ba5f3..7edfb8590 100644
+--- a/arch/arm64/boot/dts/apple/t8015.dtsi
++++ b/arch/arm64/boot/dts/apple/t8015.dtsi
+@@ -348,6 +348,17 @@ serial0: serial@22e600000 {
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * uart4 carries the ADT's "wlan" node (wlan-pcie-uart,bcm4357):
++		 * the platform-control function of the PCIe Wi-Fi module.
++		 */
++		wlan_uart4: wlan-platform-control@22e610000 {
++			compatible = "apple,t8010-wlan-uart-provider";
++			reg = <0x2 0x2e610000 0x0 0x4000>;
++			power-domains = <&ps_uart4>;
++			status = "disabled";
++		};
++
+ 		bus@230000000 {
+ 			compatible = "apple,t8015-usb-complex", "simple-pm-bus";
+ 			#address-cells = <2>;

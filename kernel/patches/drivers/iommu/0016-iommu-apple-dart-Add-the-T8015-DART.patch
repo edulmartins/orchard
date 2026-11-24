@@ -31,14 +31,11 @@ iBoot's values stay) and its own reload after the PCIe port powers up.
 Assisted-by: LLM
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- drivers/iommu/apple-dart.c | 136 ++++++++++++++++++++++++++++++++++---
- 1 file changed, 125 insertions(+), 11 deletions(-)
-
 diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
-index 1ee6add55..44f0978ae 100644
+index d559de29a..b34ca700c 100644
 --- a/drivers/iommu/apple-dart.c
 +++ b/drivers/iommu/apple-dart.c
-@@ -86,6 +86,17 @@
+@@ -95,6 +95,17 @@
  
  #define DART_S5L8960X_TTBR	0x40
  
@@ -56,7 +53,7 @@ index 1ee6add55..44f0978ae 100644
  /* T8020/T6000 registers */
  
  #define DART_T8020_STREAM_COMMAND 0x20
-@@ -286,8 +297,19 @@ struct apple_dart_hw {
+@@ -371,8 +382,19 @@ struct apple_dart_hw {
  
  	/* S5L8960X family: write the error reflector before any other access */
  	bool early_error_reflector;
@@ -76,7 +73,7 @@ index 1ee6add55..44f0978ae 100644
  };
  
  /*
-@@ -609,6 +631,31 @@ apple_dart_s5l8960x_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+@@ -712,6 +734,31 @@ apple_dart_s5l8960x_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
  		stream_map, DART_S5L8960X_STREAM_COMMAND_INVALIDATE);
  }
  
@@ -108,7 +105,7 @@ index 1ee6add55..44f0978ae 100644
  static int
  apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
  {
-@@ -625,20 +672,20 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+@@ -728,9 +775,9 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
  
  static void apple_dart_s5l8960x_set_reflector(struct apple_dart *dart)
  {
@@ -117,8 +114,10 @@ index 1ee6add55..44f0978ae 100644
  		writel(dart->error_reflector,
 -		       dart->regs + DART_S5L8960X_ERROR_REFLECTOR);
 +		       dart->regs + dart->hw->error_reflector_reg);
- }
- 
+ 	if (dart->smmu && dart->has_error_reflector)
+ 		writel(dart->error_reflector,
+ 		       dart->smmu + DART_S5L8960X_SMMU_REFLECTOR);
+@@ -739,12 +786,12 @@ static void apple_dart_s5l8960x_set_reflector(struct apple_dart *dart)
  /* The configuration iOS writes after the TCR: fetch, then diag */
  static void apple_dart_s5l8960x_set_configs(struct apple_dart *dart)
  {
@@ -132,10 +131,10 @@ index 1ee6add55..44f0978ae 100644
  		writel(dart->diag_config,
 -		       dart->regs + DART_S5L8960X_DIAG_CONFIG);
 +		       dart->regs + dart->hw->diag_config_reg);
+ 	if (dart->smmu)
+ 		writel(0, dart->smmu + DART_S5L8960X_SMMU_DIAG);
  }
- 
- static int apple_dart_hw_reset(struct apple_dart *dart)
-@@ -754,6 +801,22 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
+@@ -871,6 +918,22 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
  	return ret;
  }
  
@@ -158,7 +157,7 @@ index 1ee6add55..44f0978ae 100644
  int apple_dart_reload_configuration(struct device_node *np, u32 sid)
  {
  	struct platform_device *pdev;
-@@ -769,7 +832,7 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
+@@ -886,7 +949,7 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
  		ret = -EPROBE_DEFER;
  		goto out_put_device;
  	}
@@ -167,7 +166,7 @@ index 1ee6add55..44f0978ae 100644
  		ret = -EOPNOTSUPP;
  		goto out_put_device;
  	}
-@@ -782,7 +845,7 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
+@@ -899,7 +962,7 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
  	if (dart->sid2group[sid])
  		ret = -EBUSY;
  	else
@@ -176,7 +175,7 @@ index 1ee6add55..44f0978ae 100644
  	mutex_unlock(&apple_dart_groups_lock);
  
  out_put_device:
-@@ -1033,7 +1096,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
+@@ -1152,7 +1215,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
  	 * by masking the base off below, which equals subtracting it only if
  	 * the base is aligned beyond the window size.
  	 */
@@ -185,7 +184,7 @@ index 1ee6add55..44f0978ae 100644
  	    cfg->dma_max - cfg->dma_min >= (cfg->dma_min & -cfg->dma_min)) {
  		dev_err(dart->dev, "DMA window %pad..%pad is not base-aligned\n",
  			&cfg->dma_min, &cfg->dma_max);
-@@ -1055,7 +1118,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
+@@ -1174,7 +1237,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
  		.coherent_walk = 1,
  		.iommu_dev = dart->dev,
  	};
@@ -194,7 +193,7 @@ index 1ee6add55..44f0978ae 100644
  		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_APPLE_DART_S5L8960X;
  	if (dart->hw->no_perms)
  		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_NO_PERMS;
-@@ -1067,7 +1130,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
+@@ -1186,7 +1249,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
  		goto done;
  	}
  
@@ -203,7 +202,7 @@ index 1ee6add55..44f0978ae 100644
  		dart_domain->mask = ~cfg->dma_min;
  	else
  		dart_domain->mask = DMA_BIT_MASK(pgtbl_cfg.ias);
-@@ -1805,6 +1868,11 @@ static void apple_dart_remove(struct platform_device *pdev)
+@@ -1998,6 +2061,11 @@ static void apple_dart_remove(struct platform_device *pdev)
  
  static const struct apple_dart_hw apple_dart_hw_s5l8960x = {
  	.type = DART_S5L8960X,
@@ -215,7 +214,7 @@ index 1ee6add55..44f0978ae 100644
  	.irq_handler = apple_dart_s5l8960x_irq,
  	.invalidate_tlb = apple_dart_s5l8960x_hw_invalidate_tlb,
  	.read_tcr = apple_dart_s5l8960x_read_tcr,
-@@ -1833,6 +1901,11 @@ static const struct apple_dart_hw apple_dart_hw_s5l8960x = {
+@@ -2026,6 +2094,11 @@ static const struct apple_dart_hw apple_dart_hw_s5l8960x = {
  
  static const struct apple_dart_hw apple_dart_hw_t7000 = {
  	.type = DART_S5L8960X,
@@ -227,7 +226,7 @@ index 1ee6add55..44f0978ae 100644
  	.irq_handler = apple_dart_s5l8960x_irq,
  	.invalidate_tlb = apple_dart_s5l8960x_hw_invalidate_tlb,
  	.read_tcr = apple_dart_s5l8960x_read_tcr,
-@@ -1876,6 +1949,46 @@ static const struct apple_dart_hw apple_dart_hw_t7000 = {
+@@ -2069,6 +2142,46 @@ static const struct apple_dart_hw apple_dart_hw_t7000 = {
  	.no_perms = false,
  };
  
@@ -274,7 +273,7 @@ index 1ee6add55..44f0978ae 100644
  static const struct apple_dart_hw apple_dart_hw_t8103 = {
  	.type = DART_T8020,
  	.irq_handler = apple_dart_t8020_irq,
-@@ -2030,6 +2143,7 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dar
+@@ -2254,6 +2367,7 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dar
  static const struct of_device_id apple_dart_of_match[] = {
  	{ .compatible = "apple,s5l8960x-dart", .data = &apple_dart_hw_s5l8960x },
  	{ .compatible = "apple,t7000-dart", .data = &apple_dart_hw_t7000 },
